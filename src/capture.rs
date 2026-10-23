@@ -150,11 +150,16 @@ fn run_pipewire(
     let tx_frame = Arc::clone(tx);
     let cancel_cb = Arc::clone(cancel);
     let mainloop_cb = mainloop.clone();
+    let announced_frame = Arc::new(AtomicBool::new(false));
 
     let _listener = stream
         .add_local_listener_with_user_data(())
         .state_changed(move |_, _, old, new| {
-            tracing::debug!("pipewire state: {old:?} -> {new:?}");
+            if matches!(new, pw::stream::StreamState::Error(_)) {
+                tracing::error!("pipewire stream entered error state: {old:?} -> {new:?}");
+            } else {
+                tracing::info!("pipewire state: {old:?} -> {new:?}");
+            }
         })
         .param_changed(move |_, _, id, param| {
             let Some(param) = param else { return };
@@ -230,6 +235,9 @@ fn run_pipewire(
                 height,
                 rgba,
             });
+            if !announced_frame.swap(true, Ordering::Relaxed) {
+                tracing::info!("first frame delivered: {width}x{height}");
+            }
         })
         .register()?;
 

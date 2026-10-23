@@ -85,16 +85,39 @@ fn execute(
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut total: usize = 0;
+    let mut frames_seen: usize = 0;
+    let mut consecutive_failures: usize = 0;
+    let mut stall_reported = false;
+    let started_at = std::time::Instant::now();
 
     while !shutdown.load(Ordering::Relaxed) {
         let frame = match frame_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(frame) => frame,
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                if !stall_reported
+                    && frames_seen == 0
+                    && started_at.elapsed() > Duration::from_secs(8)
+                {
+                    stall_reported = true;
+                    emit(
+                        events,
+                        Event::Failed(
+                            "Capture connected but no frames arrived within 8s. \
+                             See the log for the PipeWire stream state."
+                                .into(),
+                        ),
+                    );
+                }
+                continue;
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
+        frames_seen += 1;
+
         match engine.scan(&frame.rgba, frame.width, frame.height) {
             Ok(scan) => {
+                consecutive_failures = 0;
                 let fresh: Vec<String> = scan
                     .lines
                     .into_iter()
@@ -105,12 +128,24 @@ fn execute(
                     emit(events, Event::Fresh { lines: fresh, total });
                 }
             }
-            Err(err) => tracing::warn!("scan failed: {err}"),
+            Err(err) => {
+                consecutive_failures += 1;
+                tracing::warn!("scan failed: {err}");
+                if consecutive_failures == 3 {
+                    let hint = if japanese_only {
+                        " — qocrd found no Japanese text on screen. \
+                         Try --all-languages."
+                    } else {
+                        ""
+                    };
+                    emit(events, Event::Failed(format!("OCR returned nothing{hint}")));
+                }
+            }
         }
     }
 
     drop(session);
-    tracing::info!("pipeline stopped after {total} lines");
+    tracing::info!("pipeline stopped after {total} lines from {frames_seen} frames");
     Ok(())
 }
 
