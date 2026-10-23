@@ -201,9 +201,10 @@ fn run_pipewire(
                 return;
             };
             let stride = datas.chunk().stride().unsigned_abs() as usize;
-            let (width, height) = {
-                let g = info_size.lock().expect("size lock");
-                (g.size().width, g.size().height)
+            let (width, height, bgr_order) = {
+                let g = info_size.lock().expect("info lock");
+                let bgr = is_bgr_order(g.format());
+                (g.size().width, g.size().height, bgr)
             };
             if width == 0 || height == 0 {
                 return;
@@ -222,8 +223,12 @@ fn run_pipewire(
                 }
                 chunk[..copy].copy_from_slice(&source[src_offset..src_offset + copy]);
             }
-            for [r, _g, b, _] in rgba.as_chunks_mut::<4>().0 {
-                std::mem::swap(r, b);
+            // Only BGR-ordered formats need the red/blue swap. Swapping on an
+            // already-RGB frame would hand OCR a colour-inverted image.
+            if bgr_order {
+                for [r, _g, b, _] in rgba.as_chunks_mut::<4>().0 {
+                    std::mem::swap(r, b);
+                }
             }
 
             let guard = tx_frame.lock().expect("tx lock");
@@ -294,4 +299,12 @@ fn run_pipewire(
     mainloop.run();
     tracing::info!("pipewire mainloop exited");
     Ok(())
+}
+/// True when the negotiated format stores bytes as blue, green, red.
+fn is_bgr_order(format: pw::spa::param::video::VideoFormat) -> bool {
+    use pw::spa::param::video::VideoFormat as F;
+    matches!(
+        format,
+        F::BGR | F::BGRx | F::BGRA | F::ARGB | F::xBGR | F::ABGR
+    )
 }

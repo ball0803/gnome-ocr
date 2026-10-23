@@ -6,9 +6,10 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use image::{ImageBuffer, ImageFormat, Rgba};
 use serde::Deserialize;
 
@@ -86,6 +87,7 @@ impl Drop for Process {
 pub struct Engine {
     process: Process,
     japanese_only: bool,
+    scratch: PathBuf,
 }
 
 impl Engine {
@@ -93,6 +95,7 @@ impl Engine {
         Ok(Self {
             process: Process::spawn()?,
             japanese_only,
+            scratch: scratch_path(),
         })
     }
 
@@ -101,29 +104,38 @@ impl Engine {
     /// A protocol failure replaces the qocrd child so the next scan starts
     /// from a clean daemon, then reports the error to the caller.
     pub fn scan(&mut self, rgba: &[u8], width: u32, height: u32) -> Result<ScanResult> {
-        let scratch = scratch_path();
-        let outcome = write_png(&scratch, rgba, width, height)
-            .and_then(|()| self.exchange(&scratch));
+        let outcome = match write_png(&self.scratch, rgba, width, height) {
+            Ok(()) => self.exchange(),
+            Err(err) => Err(err),
+        };
 
         match outcome {
-            Ok(lines) => {
-                let _ = std::fs::remove_file(&scratch);
-                Ok(ScanResult { lines })
+            Ok(scan) => {
+                tracing::info!(
+                    "scan ok: {width}x{height}, {} line(s) recognised",
+                    scan.lines.len()
+                );
+                let _ = std::fs::remove_file(&self.scratch);
+                Ok(scan)
             }
             Err(err) => {
-                tracing::warn!("qocrd scan failed ({err}); replacing the daemon");
+                tracing::warn!(
+                    "scan failed at {width}x{height} ({} bytes, mean luma {:.1}): {err}",
+                    rgba.len(),
+                    mean_luma(rgba)
+                );
                 self.process = Process::spawn()?;
-                let _ = std::fs::remove_file(&scratch);
+                let _ = std::fs::remove_file(&self.scratch);
                 Err(err)
             }
         }
     }
 
-    fn exchange(&mut self, scratch: &Path) -> Result<Vec<String>> {
+    fn exchange(&mut self) -> Result<ScanResult> {
         let command = format!(
             "scanfile {} {}\n",
             if self.japanese_only { "true" } else { "false" },
-            scratch.display()
+            self.scratch.display()
         );
         self.process
             .stdin
@@ -131,56 +143,54 @@ impl Engine {
             .context("write command to qocrd")?;
         self.process.stdin.flush().context("flush qocrd stdin")?;
 
-        let responses =
-            serde_json::Deserializer::from_reader(&mut self.process.stdout).into_iter::<ScanFileResponse>();
+        // qocrd terminates each reply with a NUL byte, so read exactly one
+        // JSON value. Trying to read a second value lands on that NUL and
+        // fails to parse.
+        let response = serde_json::Deserializer::from_reader(&mut self.process.stdout)
+            .into_iter::<ScanFileResponse>()
+            .next()
+            .context("qocrd closed stdout without replying")?
+            .context("parse qocrd response")?;
 
         let mut lines: Vec<String> = Vec::new();
-        // qocrd may emit a bare status envelope before the real payload, so
-        // keep reading values until one carries text (bounded, so a silent
-        // daemon cannot spin here forever).
-        for response in responses.take(16) {
-            let response = response.context("parse qocrd response")?;
-            if !response.text.trim().is_empty() {
-                lines.extend(
-                    response
-                        .text
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .map(ToOwned::to_owned),
-                );
-            }
+        if !response.text.trim().is_empty() {
             lines.extend(
                 response
-                    .lines
-                    .into_iter()
-                    .map(|line| line.text.trim().to_owned())
-                    .filter(|line| !line.is_empty()),
+                    .text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(ToOwned::to_owned),
             );
-            if !lines.is_empty() {
-                break;
-            }
         }
-
-        if lines.is_empty() {
-            return Err(anyhow!("qocrd returned no text"));
-        }
+        lines.extend(
+            response
+                .lines
+                .into_iter()
+                .map(|line| line.text.trim().to_owned())
+                .filter(|line| !line.is_empty()),
+        );
 
         // `text` and `lines` frequently repeat the same content.
         let mut seen = std::collections::HashSet::new();
         lines.retain(|line| seen.insert(line.clone()));
-        Ok(lines)
+
+        Ok(ScanResult { lines })
     }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(scratch_path());
+        let _ = std::fs::remove_file(&self.scratch);
     }
 }
 
+/// Each engine needs its own scratch file: two engines sharing one path race
+/// and read each other's partially written image.
 fn scratch_path() -> PathBuf {
-    std::env::temp_dir().join("gnome-ocr-frame.png")
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("gnome-ocr-frame-{}-{id}.png", std::process::id()))
 }
 
 fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<()> {
@@ -210,6 +220,18 @@ fn which(binary: &str) -> Option<PathBuf> {
             .find(|candidate| candidate.is_file())
     })
 }
+fn mean_luma(rgba: &[u8]) -> f32 {
+    let mut total = 0u64;
+    for [r, g, b, _] in rgba.as_chunks::<4>().0 {
+        total += u64::from(*r) + u64::from(*g) + u64::from(*b);
+    }
+    let samples = rgba.len() / 4 * 3;
+    if samples == 0 {
+        return 0.0;
+    }
+    total as f32 / samples as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +289,16 @@ mod tests {
             recognised.contains("HELLO"),
             "expected HELLO in recognised text, got {recognised:?}"
         );
+    }
+
+    /// A frame with no text used to fail: the reader looked for a second JSON
+    /// value and hit the NUL byte qocrd terminates replies with.
+    #[test]
+    fn returns_no_text_for_a_blank_frame_instead_of_erroring() {
+        let (width, height, rgba) = render_text("");
+        let mut engine = Engine::spawn(false).expect("spawn qocrd");
+        let result = engine.scan(&rgba, width, height).expect("blank frame must not error");
+        assert!(result.lines.is_empty(), "expected no lines, got {:?}", result.lines);
     }
 
     #[test]

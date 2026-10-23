@@ -132,13 +132,12 @@ fn execute(
                 consecutive_failures += 1;
                 tracing::warn!("scan failed: {err}");
                 if consecutive_failures == 3 {
-                    let hint = if japanese_only {
-                        " — qocrd found no Japanese text on screen. \
-                         Try --all-languages."
-                    } else {
-                        ""
-                    };
-                    emit(events, Event::Failed(format!("OCR returned nothing{hint}")));
+                    emit(
+                        events,
+                        Event::Failed(
+                            "qocrd failed on 3 consecutive frames. See the log.".into(),
+                        ),
+                    );
                 }
             }
         }
