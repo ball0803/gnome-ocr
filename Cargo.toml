@@ -1,0 +1,33 @@
+[package]
+name = "gnome-ocr"
+version = "0.2.0"
+edition = "2024"
+description = "Screen capture to clipboard: PipeWire screen capture plus qocr OCR"
+license = "GPL-3.0-or-later"
+default-run = "gnome-ocr"
+autoexamples = false
+
+[dependencies]
+gtk = { version = "0.11", package = "gtk4", features = ["gnome_48"] }
+
+async-channel = "2"
+
+tokio = { version = "1", features = ["rt", "time"] }
+
+ashpd = { version = "0.13", default-features = false, features = ["frontend", "tokio"] }
+pipewire = { version = "0.10", features = ["v0_3_77"] }
+
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
