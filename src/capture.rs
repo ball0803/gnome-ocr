@@ -179,7 +179,7 @@ fn run_pipewire(
             let stride = datas.chunk().stride().unsigned_abs() as usize;
             let (width, height) = {
                 let g = info_size.lock().expect("size lock");
-                (g.size().width as u32, g.size().height as u32)
+                (g.size().width, g.size().height)
             };
             if width == 0 || height == 0 {
                 return;
@@ -198,8 +198,8 @@ fn run_pipewire(
                 }
                 chunk[..copy].copy_from_slice(&source[src_offset..src_offset + copy]);
             }
-            for pixel in rgba.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
+            for [r, _g, b, _] in rgba.as_chunks_mut::<4>().0 {
+                std::mem::swap(r, b);
             }
 
             let guard = tx_frame.lock().expect("tx lock");

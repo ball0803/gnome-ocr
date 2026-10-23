@@ -9,12 +9,19 @@ mod engine;
 mod pipeline;
 mod ui;
 
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use gtk::glib;
 
 fn main() -> glib::ExitCode {
     init_logging();
+    tracing::info!(
+        "gnome-ocr {} starting (japanese_only={})",
+        env!("CARGO_PKG_VERSION"),
+        japanese_only()
+    );
     ui::run(japanese_only())
 }
 
@@ -27,30 +34,69 @@ fn init_logging() {
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    if let Some(file) = log_file().and_then(|path| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
-    }) {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter.clone())
-            .with_writer(file)
-            .with_ansi(false)
-            .try_init();
-        tracing::info!("gnome-ocr starting; log at {}", log_file().unwrap_or_default().display());
+    match log_file().and_then(open_log_file) {
+        Some(file) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(Tee {
+                    file: Arc::new(Mutex::new(file)),
+                })
+                .try_init();
+        }
+        None => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(true)
+                .with_writer(std::io::stderr)
+                .try_init();
+        }
+    }
+}
+
+fn open_log_file(path: PathBuf) -> Option<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+/// Mirrors every log line to stderr and to the on-disk log at once.
+#[derive(Clone)]
+struct Tee {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl Write for Tee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::stderr().write_all(buf)?;
+        self.file.lock().expect("log file lock").write_all(buf)?;
+        Ok(buf.len())
     }
 
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()?;
+        self.file.lock().expect("log file lock").flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for Tee {
+    type Writer = Tee;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
 }
 
 fn log_file() -> Option<PathBuf> {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+        })
         .map(|base| base.join("gnome-ocr/gnome-ocr.log"))
 }
