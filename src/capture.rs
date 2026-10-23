@@ -51,11 +51,30 @@ impl Drop for Session {
     }
 }
 
+/// What the portal should offer as a capture target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    /// A whole monitor.
+    Screen,
+    /// A single application window, chosen in the portal dialog.
+    Window,
+}
+
+impl SourceKind {
+    fn source_type(self) -> SourceType {
+        match self {
+            SourceKind::Screen => SourceType::Monitor,
+            SourceKind::Window => SourceType::Window,
+        }
+    }
+}
+
 /// Request a ScreenCast session and begin pumping frames into `tx`.
 ///
 /// The portal shows a permission dialog once per session; the user must accept
-/// it. Returns after the portal handshake, before any frame has arrived.
-pub async fn start(tx: SyncSender<Frame>) -> Result<Session> {
+/// it, and pick which screen or window to share. Returns after the portal
+/// handshake, before any frame has arrived.
+pub async fn start(tx: SyncSender<Frame>, source: SourceKind) -> Result<Session> {
     let proxy = Screencast::new().await?;
     let session = proxy.create_session(Default::default()).await?;
     proxy
@@ -63,7 +82,7 @@ pub async fn start(tx: SyncSender<Frame>) -> Result<Session> {
             &session,
             SelectSourcesOptions::default()
                 .set_cursor_mode(CursorMode::Hidden)
-                .set_sources(BitFlags::from(SourceType::Monitor))
+                .set_sources(BitFlags::from(source.source_type()))
                 .set_multiple(false)
                 .set_persist_mode(PersistMode::DoNot),
         )
