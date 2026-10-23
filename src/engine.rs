@@ -210,3 +210,69 @@ fn which(binary: &str) -> Option<PathBuf> {
             .find(|candidate| candidate.is_file())
     })
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Renders `text` to an opaque white image and returns it as RGBA8.
+    ///
+    /// ARgb32 is premultiplied BGRA in native byte order. Everything drawn
+    /// here is fully opaque, so alpha needs no unpremultiplying.
+    fn render_text(text: &str) -> (u32, u32, Vec<u8>) {
+        use gtk::cairo;
+
+        let width = 1000i32;
+        let height = 220i32;
+        let mut surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, width, height).expect("surface");
+        {
+            let context = cairo::Context::new(&surface).expect("context");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("paint background");
+            context.set_source_rgb(0.0, 0.0, 0.0);
+            context.select_font_face("sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
+            context.set_font_size(64.0);
+            context.move_to(40.0, 150.0);
+            context.show_text(text).expect("draw text");
+        }
+
+        surface.flush();
+        let stride = surface.stride() as usize;
+        let data = surface.data().expect("surface data");
+
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for row in 0..height as usize {
+            for column in 0..width as usize {
+                let offset = row * stride + column * 4;
+                rgba.extend_from_slice(&[
+                    data[offset + 2],
+                    data[offset + 1],
+                    data[offset],
+                    data[offset + 3],
+                ]);
+            }
+        }
+        (width as u32, height as u32, rgba)
+    }
+
+    #[test]
+    fn recognises_text_rendered_into_a_frame() {
+        let (width, height, rgba) = render_text("HELLO WORLD 12345");
+        let mut engine = Engine::spawn(false).expect("spawn qocrd");
+        let result = engine.scan(&rgba, width, height).expect("scan should succeed");
+
+        assert!(!result.lines.is_empty(), "qocrd returned no text");
+        let recognised = result.lines.join(" ");
+        assert!(
+            recognised.contains("HELLO"),
+            "expected HELLO in recognised text, got {recognised:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_frame_whose_size_does_not_match_its_pixels() {
+        let mut engine = Engine::spawn(false).expect("spawn qocrd");
+        let too_small = vec![0u8; 16];
+        assert!(engine.scan(&too_small, 100, 100).is_err());
+    }
+}
