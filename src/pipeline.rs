@@ -5,7 +5,6 @@
 //! frame stream stay up. Starting again therefore needs no portal request and
 //! cannot fail the way a fresh permission request can.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -14,17 +13,31 @@ use std::time::Duration;
 use async_channel::Sender;
 
 use crate::capture::Capture;
+use crate::dedupe::History;
 use crate::engine::Engine;
 
 /// One update for the UI.
 #[derive(Debug)]
 pub enum Event {
     Started,
-    Fresh { lines: Vec<String>, total: usize },
+    /// Text that was recognised, and where it was found.
+    Scanned {
+        /// The detections that had not been seen before.
+        fresh: Vec<crate::dedupe::Detection>,
+        /// Everything found in this frame.
+        found: Vec<crate::dedupe::Detection>,
+        /// How many new detections there have been in total.
+        total: usize,
+    },
     Failed(String),
     Stopped,
     /// A small PNG of the captured frame, for the preview pane.
-    Preview(Vec<u8>),
+    Preview {
+        png: Vec<u8>,
+        /// The size of the frame the PNG was taken from.
+        frame_width: u32,
+        frame_height: u32,
+    },
     /// What the portal is sharing.
     Source(String),
 }
@@ -123,7 +136,7 @@ fn run(
 
         let mut capture: Option<Capture> = None;
         let mut engine: Option<Engine> = None;
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut history = History::new();
         let mut total: usize = 0;
         let mut recognising = false;
         let mut last_preview = std::time::Instant::now() - Duration::from_millis(700);
@@ -227,22 +240,49 @@ fn run(
 
             if last_preview.elapsed() >= Duration::from_millis(700) {
                 last_preview = std::time::Instant::now();
-                if let Some(png) = crate::preview::preview_png(&frame.rgba, frame.width, frame.height, 1024)
+                if let Some(png) =
+                    crate::preview::preview_png(&frame.rgba, frame.width, frame.height, 1024)
                 {
-                    emit(&events, Event::Preview(png));
+                    emit(
+                        &events,
+                        Event::Preview {
+                            png,
+                            frame_width: frame.width,
+                            frame_height: frame.height,
+                        },
+                    );
                 }
             }
 
             match engine.scan(&frame.rgba, frame.width, frame.height) {
                 Ok(scan) => {
-                    let fresh: Vec<String> = scan
-                        .lines
-                        .into_iter()
-                        .filter(|line| seen.insert(line.clone()))
-                        .collect();
+                    let mut fresh = Vec::new();
+                    let mut found = Vec::new();
+                    for detection in scan.detections {
+                        if history.is_new(&detection) {
+                            fresh.push(detection.clone());
+                        }
+                        found.push(detection);
+                    }
                     if !fresh.is_empty() {
                         total += fresh.len();
-                        emit(&events, Event::Fresh { lines: fresh, total });
+                        emit(
+                            &events,
+                            Event::Scanned {
+                                fresh,
+                                found,
+                                total,
+                            },
+                        );
+                    } else {
+                        emit(
+                            &events,
+                            Event::Scanned {
+                                fresh,
+                                found,
+                                total,
+                            },
+                        );
                     }
                 }
                 Err(err) => {

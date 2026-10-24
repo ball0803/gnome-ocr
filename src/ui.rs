@@ -14,6 +14,7 @@ use gtk::gdk::prelude::*;
 use gtk::prelude::*;
 use gtk::{cairo, gio, glib};
 
+use crate::dedupe::Detection;
 use crate::pipeline::{Event, Pipeline};
 use crate::region::Region;
 
@@ -84,6 +85,12 @@ struct Preview {
     /// Where the drag started. GtkGestureDrag reports the offset from this
     /// point, so the position is the start plus the offset.
     start: Cell<Option<(f64, f64)>>,
+    /// The size of the frame the detections were found in.
+    frame_size: Cell<(f64, f64)>,
+    /// Everything the recogniser found in the last frame.
+    detections: RefCell<Vec<Detection>>,
+    /// Whether to draw where the text was found.
+    show_boxes: Cell<bool>,
 }
 
 impl Preview {
@@ -95,6 +102,9 @@ impl Preview {
             drag: RefCell::new(None),
             rect: Cell::new(None),
             start: Cell::new(None),
+            frame_size: Cell::new((0.0, 0.0)),
+            detections: RefCell::new(Vec::new()),
+            show_boxes: Cell::new(true),
         }
     }
 
@@ -159,6 +169,21 @@ impl Preview {
         };
         crop.x = crop.x.clamp(left, left + width - crop.width);
         crop.y = crop.y.clamp(top, top + height - crop.height);
+    }
+
+    /// Where a detection sits in the preview.
+    fn detection_rect(&self, detection: &Detection) -> Option<(f64, f64, f64, f64)> {
+        let (frame_width, frame_height) = self.frame_size.get();
+        let (left, top, width, height) = self.rect.get()?;
+        if frame_width <= 0.0 || frame_height <= 0.0 {
+            return None;
+        }
+        Some((
+            left + detection.bounds.x / frame_width * width,
+            top + detection.bounds.y / frame_height * height,
+            detection.bounds.width / frame_width * width,
+            detection.bounds.height / frame_height * height,
+        ))
     }
 
     /// The crop as a fraction of the frame, for the recogniser.
@@ -271,6 +296,7 @@ struct Window {
     stop_button: gtk::Button,
     change_button: gtk::Button,
     reset_button: gtk::Button,
+    show_boxes: gtk::CheckButton,
     copy_button: gtk::Button,
     clear_button: gtk::Button,
     auto_copy: gtk::Switch,
@@ -356,11 +382,17 @@ impl Window {
             "Drag to draw a crop, drag a handle to resize it, drag inside it to move it.",
         ));
 
+        let show_boxes = gtk::CheckButton::with_label("Show where text was found");
+        show_boxes.set_active(true);
+        show_boxes.set_margin_start(12);
+        show_boxes.set_margin_bottom(6);
+
         let preview_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
         preview_pane.set_margin_start(12);
         preview_pane.set_margin_end(12);
         preview_pane.set_margin_bottom(8);
         preview_pane.append(&canvas);
+        preview_pane.append(&show_boxes);
 
         let status = gtk::Label::new(Some("Idle — press Start OCR to begin."));
         status.set_xalign(0.0);
@@ -411,6 +443,7 @@ impl Window {
             stop_button,
             change_button,
             reset_button,
+            show_boxes,
             copy_button,
             clear_button,
             auto_copy,
@@ -465,6 +498,21 @@ impl Window {
             let _ = context.set_source_surface(&surface, left, top);
             let _ = context.paint();
             let _ = context.restore();
+
+            // Where the text was found.
+            if preview.show_boxes.get() {
+                for detection in preview.detections.borrow().iter() {
+                    let Some((box_x, box_y, box_width, box_height)) =
+                        preview.detection_rect(detection)
+                    else {
+                        continue;
+                    };
+                    context.set_source_rgba(0.2, 1.0, 0.4, 0.9);
+                    context.set_line_width(1.5);
+                    context.rectangle(box_x, box_y, box_width, box_height);
+                    let _ = context.stroke();
+                }
+            }
 
             let Some((left, top, width, height)) = preview.crop_rect() else {
                 return;
@@ -647,6 +695,12 @@ impl Window {
             .connect_clicked(move |_| owner.change_source());
 
         let owner = Rc::clone(self);
+        self.show_boxes.connect_toggled(move |button| {
+            owner.preview.show_boxes.set(button.is_active());
+            owner.canvas.queue_draw();
+        });
+
+        let owner = Rc::clone(self);
         self.reset_button.connect_clicked(move |_| {
             *owner.preview.crop.borrow_mut() = None;
             owner.publish_region();
@@ -722,11 +776,24 @@ impl Window {
                 self.change_button.set_sensitive(false);
                 self.set_status("Stopped.");
             }
-            Event::Fresh { lines, total } => {
-                let joined = lines.join("\n");
-                self.append(&format!("{joined}\n"));
-                if self.auto_copy.is_active() {
-                    self.root.clipboard().set_text(&joined);
+            Event::Scanned {
+                fresh,
+                found,
+                total,
+            } => {
+                *self.preview.detections.borrow_mut() = found;
+                self.canvas.queue_draw();
+
+                if !fresh.is_empty() {
+                    let joined = fresh
+                        .iter()
+                        .map(|detection| detection.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.append(&format!("{joined}\n"));
+                    if self.auto_copy.is_active() {
+                        self.root.clipboard().set_text(&joined);
+                    }
                 }
                 self.set_status(&format!("{total} line(s) captured."));
             }
@@ -739,7 +806,14 @@ impl Window {
             Event::Source(description) => {
                 self.source_label.set_text(&description);
             }
-            Event::Preview(png) => {
+            Event::Preview {
+                png,
+                frame_width,
+                frame_height,
+            } => {
+                self.preview
+                    .frame_size
+                    .set((frame_width as f64, frame_height as f64));
                 if let Ok(surface) = cairo::ImageSurface::create_from_png(&mut &png[..]) {
                     *self.preview.surface.borrow_mut() = Some(surface);
                     self.canvas.queue_draw();

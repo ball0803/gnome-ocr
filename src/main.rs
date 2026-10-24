@@ -5,6 +5,7 @@
 //! text. Newly recognised lines are optionally copied to the clipboard.
 
 mod capture;
+mod dedupe;
 mod engine;
 mod paths;
 mod pipeline;

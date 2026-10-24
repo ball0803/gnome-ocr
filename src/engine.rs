@@ -33,12 +33,27 @@ struct ScanFileResponse {
 struct ScanLine {
     #[serde(default)]
     text: String,
+    #[serde(default)]
+    aabb: Option<AxisAlignedBox>,
 }
 
-/// Recognised text from a single frame.
+/// The axis-aligned bounding box qocrd reports for a line of text.
+#[derive(Debug, Deserialize)]
+struct AxisAlignedBox {
+    #[serde(default)]
+    x: f64,
+    #[serde(default)]
+    y: f64,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+}
+
+/// Recognised text from a single frame, with where it was found.
 #[derive(Debug, Default, Clone)]
 pub struct ScanResult {
-    pub lines: Vec<String>,
+    pub detections: Vec<crate::dedupe::Detection>,
 }
 
 /// How long to wait for qocrd to answer a scan.
@@ -168,7 +183,7 @@ impl Engine {
             Ok(scan) => {
                 tracing::info!(
                     "scan ok: {width}x{height}, {} line(s) recognised",
-                    scan.lines.len()
+                    scan.detections.len()
                 );
                 let _ = std::fs::remove_file(&self.scratch);
                 Ok(scan)
@@ -230,30 +245,43 @@ impl Engine {
         }
         .context("parse qocrd response")?;
 
-        let mut lines: Vec<String> = Vec::new();
-        if !response.text.trim().is_empty() {
-            lines.extend(
-                response
-                    .text
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(ToOwned::to_owned),
-            );
+        let mut detections: Vec<crate::dedupe::Detection> = Vec::new();
+
+        // The lines carry their own geometry, which is what the preview
+        // draws and what tells repeats apart.
+        for line in response.lines {
+            let text = line.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let Some(aabb) = line.aabb else { continue };
+            detections.push(crate::dedupe::Detection {
+                text: text.to_owned(),
+                bounds: crate::dedupe::Box {
+                    x: aabb.x,
+                    y: aabb.y,
+                    width: aabb.width,
+                    height: aabb.height,
+                },
+            });
         }
-        lines.extend(
-            response
-                .lines
-                .into_iter()
-                .map(|line| line.text.trim().to_owned())
-                .filter(|line| !line.is_empty()),
-        );
 
-        // `text` and `lines` frequently repeat the same content.
-        let mut seen = std::collections::HashSet::new();
-        lines.retain(|line| seen.insert(line.clone()));
+        // Some builds only fill in the flat text.
+        if detections.is_empty() && !response.text.trim().is_empty() {
+            for text in response.text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                detections.push(crate::dedupe::Detection {
+                    text: text.to_owned(),
+                    bounds: crate::dedupe::Box {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                });
+            }
+        }
 
-        Ok(ScanResult { lines })
+        Ok(ScanResult { detections })
     }
 }
 
@@ -434,8 +462,13 @@ mod tests {
         ).expect("spawn qocrd");
         let result = engine.scan(&rgba, width, height).expect("scan should succeed");
 
-        assert!(!result.lines.is_empty(), "qocrd returned no text");
-        let recognised = result.lines.join(" ");
+        assert!(!result.detections.is_empty(), "qocrd returned no text");
+        let recognised = result
+            .detections
+            .iter()
+            .map(|detection| detection.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
             recognised.contains("HELLO"),
             "expected HELLO in recognised text, got {recognised:?}"
@@ -453,7 +486,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
         ).expect("spawn qocrd");
         let result = engine.scan(&rgba, width, height).expect("blank frame must not error");
-        assert!(result.lines.is_empty(), "expected no lines, got {:?}", result.lines);
+        assert!(result.detections.is_empty(), "expected no detections, got {:?}", result.detections);
     }
 
     #[test]

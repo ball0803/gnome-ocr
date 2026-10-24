@@ -74,6 +74,21 @@ Only the cropped part of the frame is recognised. The crop is kept as a
 fraction of the frame, so it stays put when the captured window is resized.
 **Whole capture** goes back to recognising everything.
 
+**Show where text was found** draws a box around every line the recogniser
+picked up, so you can see where the text on screen came from.
+
+## What counts as new text
+
+Text that is still on screen gets recognised again on every frame, so it is
+not inserted again. A detection counts as a repeat when its text has been
+seen before and either
+
+- the two boxes overlap, measured by Intersection over Union, or
+- the two boxes are about the same size, even if they are in different
+  places.
+
+Otherwise it is new, and is inserted and copied.
+
 Toggle **Auto-copy new text** to control whether new lines are copied to your
 clipboard; **Copy all** copies everything shown; **Clear** empties the view
 and resets the de-duplication set.
