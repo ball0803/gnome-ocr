@@ -199,15 +199,15 @@ impl Engine {
     pub fn scan(&mut self, rgba: &[u8], width: u32, height: u32) -> Result<ScanResult> {
         self.frames += 1;
         let selected = self.region.lock().ok().and_then(|region| *region);
-        let (pixels, width, height) = match selected {
+        let (pixels, width, height, origin_x, origin_y) = match selected {
             Some(region) => crop(rgba, width, height, region)
-                .unwrap_or_else(|| (rgba.to_vec(), width, height)),
-            None => (rgba.to_vec(), width, height),
+                .unwrap_or_else(|| (rgba.to_vec(), width, height, 0, 0)),
+            None => (rgba.to_vec(), width, height, 0, 0),
         };
         let outcome = match write_png(&self.scratch, &pixels, width, height) {
             Ok(()) => {
                 self.report_frame(width, height);
-                self.exchange()
+                self.exchange(origin_x, origin_y)
             }
             Err(err) => Err(err),
         };
@@ -238,7 +238,12 @@ impl Engine {
         }
     }
 
-    fn exchange(&mut self) -> Result<ScanResult> {
+    /// Asks qocrd to read the frame and returns what it found.
+    ///
+    /// The boxes come back relative to the image that was scanned, so the
+    /// origin of the crop is added back to put them where they are in the
+    /// frame.
+    fn exchange(&mut self, origin_x: u32, origin_y: u32) -> Result<ScanResult> {
         let command = format!(
             "scanfile {} {}\n",
             if self.japanese_only { "true" } else { "false" },
@@ -291,8 +296,8 @@ impl Engine {
             detections.push(crate::dedupe::Detection {
                 text: text.to_owned(),
                 bounds: crate::dedupe::Box {
-                    x: aabb.x,
-                    y: aabb.y,
+                    x: aabb.x + origin_x as f64,
+                    y: aabb.y + origin_y as f64,
                     width: aabb.width,
                     height: aabb.height,
                 },
@@ -334,7 +339,7 @@ fn crop(
     width: u32,
     height: u32,
     region: crate::region::Region,
-) -> Option<(Vec<u8>, u32, u32)> {
+) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
     if region.is_empty() {
         return None;
     }
@@ -360,7 +365,10 @@ fn crop(
         let end = start + cropped_width as usize * 4;
         out.extend_from_slice(rgba.get(start..end)?);
     }
-    Some((out, cropped_width, cropped_height))
+    // The origin is returned as well, because the boxes the recogniser
+    // reports are relative to the cropped image and have to be moved back
+    // to where they are in the frame.
+    Some((out, cropped_width, cropped_height, x0, y0))
 }
 
 /// Each engine needs its own scratch file: two engines sharing one path race
@@ -449,6 +457,11 @@ mod tests {
     /// ARgb32 is premultiplied BGRA in native byte order. Everything drawn
     /// here is fully opaque, so alpha needs no unpremultiplying.
     fn render_text(text: &str) -> (u32, u32, Vec<u8>) {
+        render_text_at(text, 40.0)
+    }
+
+    /// Draws the text at a given distance from the left of the frame.
+    fn render_text_at(text: &str, start_x: f64) -> (u32, u32, Vec<u8>) {
         use gtk::cairo;
 
         let width = 1000i32;
@@ -462,7 +475,7 @@ mod tests {
             context.set_source_rgb(0.0, 0.0, 0.0);
             context.select_font_face("sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
             context.set_font_size(64.0);
-            context.move_to(40.0, 150.0);
+            context.move_to(start_x, 150.0);
             context.show_text(text).expect("draw text");
         }
 
@@ -549,6 +562,36 @@ mod tests {
 
         let reply = receiver.recv().expect("reply").expect("parses");
         assert_eq!(reply.lines[0].text, "only");
+    }
+
+    /// The boxes the recogniser reports are relative to the image it was
+    /// given, so they have to be moved back to where they are in the frame.
+    #[test]
+    fn a_crop_moves_the_boxes_back_to_where_they_are_in_the_frame() {
+        let (width, height, rgba) = render_text_at("HELLO WORLD", 600.0);
+        let region = Arc::new(Mutex::new(Some(crate::region::Region {
+            x: 0.5,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        })));
+        let mut engine = Engine::spawn(
+            false,
+            Arc::new(AtomicBool::new(false)),
+            region,
+        )
+        .expect("spawn qocrd");
+
+        let result = engine.scan(&rgba, width, height).expect("scan");
+        let detection = result
+            .detections
+            .first()
+            .expect("the text in the right half should be found");
+        assert!(
+            detection.bounds.x >= 500.0,
+            "the box should sit where the text is in the frame, not where it is in the crop: {:?}",
+            detection.bounds
+        );
     }
 
     #[test]

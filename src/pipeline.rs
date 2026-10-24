@@ -267,26 +267,15 @@ fn run(
                         }
                         found.push(detection);
                     }
-                    if !fresh.is_empty() {
-                        total += fresh.len();
-                        emit(
-                            &events,
-                            Event::Scanned {
-                                fresh,
-                                found,
-                                total,
-                            },
-                        );
-                    } else {
-                        emit(
-                            &events,
-                            Event::Scanned {
-                                fresh,
-                                found,
-                                total,
-                            },
-                        );
-                    }
+                    total += fresh.len();
+                    emit(
+                        &events,
+                        Event::Scanned {
+                            fresh,
+                            found,
+                            total,
+                        },
+                    );
                 }
                 Err(err) => {
                     tracing::warn!("scan failed: {err}");

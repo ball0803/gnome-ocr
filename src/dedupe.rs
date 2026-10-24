@@ -244,6 +244,27 @@ mod tests {
         assert!(history.is_new(&bigger));
     }
 
+    /// The thresholds can be changed while the app is running, and the
+    /// change takes effect on the next detection.
+    #[test]
+    fn the_thresholds_can_be_changed_while_the_app_runs() {
+        let settings = Arc::new(Mutex::new(Settings::default()));
+        let mut history = History::new(Arc::clone(&settings));
+        assert!(history.is_new(&detection("hello", box_at(10.0, 10.0, 80.0, 20.0))));
+
+        // About the same size but not quite, and somewhere else, so by
+        // default it counts as new.
+        let similar = detection("hello", box_at(600.0, 400.0, 100.0, 24.0));
+        assert!(history.is_new(&similar));
+
+        // Lower the bar and the same detection is no longer new.
+        if let Ok(mut settings) = settings.lock() {
+            settings.dimension = 0.5;
+        }
+        let again = detection("hello", box_at(600.0, 400.0, 100.0, 24.0));
+        assert!(!history.is_new(&again));
+    }
+
     #[test]
     fn different_text_is_always_new() {
         let mut history = History::new(Arc::new(Mutex::new(Settings::default())));
