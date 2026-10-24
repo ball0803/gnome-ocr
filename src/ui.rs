@@ -51,6 +51,9 @@ enum Drag {
 /// What the preview shows and lets the user select.
 struct Preview {
     surface: RefCell<Option<cairo::ImageSurface>>,
+    /// The frame scaled to the size it is drawn at, so that moving the
+    /// pointer does not rescale it again for every motion event.
+    scaled: RefCell<Option<(cairo::ImageSurface, i32, i32)>>,
     crop: RefCell<Option<Region>>,
     drag: RefCell<Option<Drag>>,
     /// Where the frame was last drawn, so pointer positions can be turned
@@ -62,10 +65,37 @@ impl Preview {
     fn new() -> Self {
         Self {
             surface: RefCell::new(None),
+            scaled: RefCell::new(None),
             crop: RefCell::new(None),
             drag: RefCell::new(None),
             rect: Cell::new(None),
         }
+    }
+
+    /// The frame scaled to the size it is drawn at, built once per size.
+    fn scaled_surface(&self, width: i32, height: i32) -> Option<cairo::ImageSurface> {
+        let mut cached = self.scaled.borrow_mut();
+        if let Some((surface, cached_width, cached_height)) = cached.as_ref()
+            && *cached_width == width
+            && *cached_height == height
+        {
+            return Some(surface.clone());
+        }
+
+        let source = self.surface.borrow();
+        let source = source.as_ref()?;
+        let target = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height).ok()?;
+        {
+            let context = cairo::Context::new(&target).ok()?;
+            context.scale(
+                width as f64 / source.width() as f64,
+                height as f64 / source.height() as f64,
+            );
+            let _ = context.set_source_surface(source, 0.0, 0.0);
+            let _ = context.paint();
+        }
+        *cached = Some((target.clone(), width, height));
+        Some(target)
     }
 
     /// The rectangle the frame is drawn in, scaled to fit the space
@@ -91,27 +121,20 @@ impl Preview {
 
     /// A pointer position, as a fraction of the frame.
     fn to_fraction(&self, x: f64, y: f64) -> Option<(f64, f64)> {
-        let (left, top, width, height) = self.rect.get()?;
-        if width <= 0.0 || height <= 0.0 {
+        let rect = self.rect.get()?;
+        if rect.2 <= 0.0 || rect.3 <= 0.0 {
             return None;
         }
-        Some((
-            ((x - left) / width).clamp(0.0, 1.0),
-            ((y - top) / height).clamp(0.0, 1.0),
-        ))
+        Some(to_fraction(rect, x, y))
     }
 
     /// The crop rectangle, where it is drawn.
     fn crop_rect(&self) -> Option<(f64, f64, f64, f64)> {
         let crop = *self.crop.borrow();
         let crop = crop?;
-        let (left, top, width, height) = self.rect.get()?;
-        Some((
-            left + crop.x * width,
-            top + crop.y * height,
-            crop.width * width,
-            crop.height * height,
-        ))
+        let rect = self.rect.get()?;
+        let (left, top) = to_drawn(rect, crop.x, crop.y);
+        Some((left, top, crop.width * rect.2, crop.height * rect.3))
     }
 
     /// The handle under the pointer, if any.
@@ -184,6 +207,20 @@ fn resize(region: &mut Region, handle: Handle, x: f64, y: f64) {
     region.y = top;
     region.width = right - left;
     region.height = bottom - top;
+}
+
+/// Turns a pointer position into a fraction of the frame.
+fn to_fraction(rect: (f64, f64, f64, f64), x: f64, y: f64) -> (f64, f64) {
+    let (left, top, width, height) = rect;
+    (
+        ((x - left) / width).clamp(0.0, 1.0),
+        ((y - top) / height).clamp(0.0, 1.0),
+    )
+}
+
+/// Turns a fraction of the frame into where it is drawn.
+fn to_drawn(rect: (f64, f64, f64, f64), x: f64, y: f64) -> (f64, f64) {
+    (rect.0 + x * rect.2, rect.1 + y * rect.3)
 }
 
 pub fn run(japanese_only: bool) -> glib::ExitCode {
@@ -393,17 +430,13 @@ impl Window {
             };
             preview.rect.set(Some((left, top, drawn_width, drawn_height)));
 
-            let surface = preview.surface.borrow();
-            let Some(surface) = surface.as_ref() else {
+            let Some(surface) =
+                preview.scaled_surface(drawn_width as i32, drawn_height as i32)
+            else {
                 return;
             };
             let _ = context.save();
-            context.translate(left, top);
-            context.scale(
-                drawn_width / surface.width() as f64,
-                drawn_height / surface.height() as f64,
-            );
-            let _ = context.set_source_surface(surface, 0.0, 0.0);
+            let _ = context.set_source_surface(&surface, left, top);
             let _ = context.paint();
             let _ = context.restore();
 
@@ -411,15 +444,17 @@ impl Window {
                 return;
             };
 
-            // Dim everything outside the crop.
-            context.set_source_rgba(0.0, 0.0, 0.0, 0.55);
+            // Dim everything outside the crop. Filling the frame and the
+            // crop together with the even-odd rule darkens the frame but
+            // leaves the crop alone.
             let (frame_left, frame_top, frame_width, frame_height) =
                 preview.rect.get().unwrap_or((0.0, 0.0, 0.0, 0.0));
+            context.set_source_rgba(0.0, 0.0, 0.0, 0.55);
             context.rectangle(frame_left, frame_top, frame_width, frame_height);
-            let _ = context.fill_preserve();
-            context.set_source_rgba(0.0, 0.0, 0.0, 0.0);
             context.rectangle(left, top, width, height);
+            context.set_fill_rule(cairo::FillRule::EvenOdd);
             let _ = context.fill();
+            context.set_fill_rule(cairo::FillRule::Winding);
 
             context.set_source_rgb(0.35, 0.75, 1.0);
             context.set_line_width(1.5);
@@ -478,6 +513,7 @@ impl Window {
         });
 
         let update = Rc::clone(&self.preview);
+        let owner = Rc::clone(self);
         drag.connect_drag_update(move |_gesture, x, y| {
             let Some(fraction) = update.to_fraction(x, y) else {
                 return;
@@ -501,6 +537,10 @@ impl Window {
                 }
                 None => {}
             }
+            // Without this the rectangle only appears when the button is
+            // released, which makes the whole thing feel dead.
+            owner.canvas.queue_draw();
+            owner.update_area_label();
         });
 
         let owner = Rc::clone(self);
@@ -512,6 +552,23 @@ impl Window {
         self.canvas.add_controller(drag);
     }
 
+    /// Shows what the current crop covers, without changing it.
+    fn update_area_label(&self) {
+        let crop = *self.preview.crop.borrow();
+        match crop.filter(|crop| !crop.is_empty()) {
+            Some(region) => {
+                self.area_label.set_text(&format!(
+                    "Area: {}x{} at {},{}",
+                    (region.width * 100.0).round() as i64,
+                    (region.height * 100.0).round() as i64,
+                    (region.x * 100.0).round() as i64,
+                    (region.y * 100.0).round() as i64
+                ));
+            }
+            None => self.area_label.set_text("Area: whole capture"),
+        }
+    }
+
     /// Sends the current crop to the recogniser and updates the label.
     fn publish_region(self: &Rc<Self>) {
         let crop = *self.preview.crop.borrow();
@@ -521,20 +578,13 @@ impl Window {
             *shared = usable;
         }
 
+        self.update_area_label();
         match usable {
-            Some(region) => {
-                self.area_label.set_text(&format!(
-                    "Area: {}x{} at {},{}",
-                    (region.width * 100.0).round() as i64,
-                    (region.height * 100.0).round() as i64,
-                    (region.x * 100.0).round() as i64,
-                    (region.y * 100.0).round() as i64
-                ));
+            Some(_) => {
                 self.reset_button.set_sensitive(true);
                 self.set_status("Recognising only the selected part of the frame.");
             }
             None => {
-                self.area_label.set_text("Area: whole capture");
                 self.reset_button.set_sensitive(false);
                 self.set_status("Recognising the whole capture again.");
             }
@@ -717,6 +767,34 @@ mod tests {
             width,
             height,
         }
+    }
+
+    #[test]
+    fn a_pointer_position_becomes_a_fraction_of_the_frame() {
+        // The frame is drawn at 800x400 starting at 100,50.
+        let rect = (100.0, 50.0, 800.0, 400.0);
+        let (x, y) = to_fraction(rect, 500.0, 250.0);
+        assert!((x - 0.5).abs() < 1e-9);
+        assert!((y - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_pointer_outside_the_frame_is_clamped_to_it() {
+        let rect = (100.0, 50.0, 800.0, 400.0);
+        let (x, y) = to_fraction(rect, 0.0, 0.0);
+        assert_eq!(x, 0.0);
+        assert_eq!(y, 0.0);
+        let (x, y) = to_fraction(rect, 10_000.0, 10_000.0);
+        assert_eq!(x, 1.0);
+        assert_eq!(y, 1.0);
+    }
+
+    #[test]
+    fn a_fraction_maps_back_to_where_it_is_drawn() {
+        let rect = (100.0, 50.0, 800.0, 400.0);
+        let (x, y) = to_drawn(rect, 0.25, 0.75);
+        assert!((x - 300.0).abs() < 1e-9);
+        assert!((y - 350.0).abs() < 1e-9);
     }
 
     #[test]

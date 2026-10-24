@@ -126,7 +126,7 @@ fn run(
         let mut seen: HashSet<String> = HashSet::new();
         let mut total: usize = 0;
         let mut recognising = false;
-        let mut last_preview = std::time::Instant::now() - Duration::from_millis(500);
+        let mut last_preview = std::time::Instant::now() - Duration::from_millis(700);
 
         while !shutdown.load(Ordering::Relaxed) {
             let mut begin = false;
@@ -225,9 +225,9 @@ fn run(
                 continue;
             };
 
-            if last_preview.elapsed() >= Duration::from_millis(500) {
+            if last_preview.elapsed() >= Duration::from_millis(700) {
                 last_preview = std::time::Instant::now();
-                if let Some(png) = crate::preview::preview_png(&frame.rgba, frame.width, frame.height, 1280)
+                if let Some(png) = crate::preview::preview_png(&frame.rgba, frame.width, frame.height, 1024)
                 {
                     emit(&events, Event::Preview(png));
                 }
