@@ -63,7 +63,7 @@ pub async fn start(tx: SyncSender<Frame>) -> Result<Session> {
         .select_sources(
             &session,
             SelectSourcesOptions::default()
-                .set_cursor_mode(CursorMode::Hidden)
+                .set_cursor_mode(CursorMode::Embedded)
                 .set_sources(SourceType::Monitor | SourceType::Window)
                 .set_multiple(false)
                 .set_persist_mode(PersistMode::DoNot),
@@ -229,18 +229,23 @@ fn run_pipewire(
                 for x in 0..width as usize {
                     let input = &row[x * pixel_size..];
                     let output = &mut rgba[(y * width as usize + x) * 4..];
-                    let alpha = if pixel_size == 4 {
-                        input[3]
-                    } else {
-                        0xFF
-                    };
+                    // The fourth byte of an "x" format is padding, not alpha.
+                    // Reading it as alpha yields a transparent image when the
+                    // compositor leaves it zero.
                     match format {
-                        VideoFormat::RGB | VideoFormat::RGBA | VideoFormat::RGBx => {
-                            output.copy_from_slice(&[input[0], input[1], input[2], alpha]);
+                        VideoFormat::RGB | VideoFormat::RGBx => {
+                            output.copy_from_slice(&[input[0], input[1], input[2], 0xFF]);
                         }
-                        _ => {
-                            output.copy_from_slice(&[input[2], input[1], input[0], alpha]);
+                        VideoFormat::RGBA => {
+                            output.copy_from_slice(&[input[0], input[1], input[2], input[3]]);
                         }
+                        VideoFormat::BGR | VideoFormat::BGRx => {
+                            output.copy_from_slice(&[input[2], input[1], input[0], 0xFF]);
+                        }
+                        VideoFormat::BGRA => {
+                            output.copy_from_slice(&[input[2], input[1], input[0], input[3]]);
+                        }
+                        _ => return,
                     }
                 }
             }
