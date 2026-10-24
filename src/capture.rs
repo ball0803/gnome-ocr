@@ -146,30 +146,31 @@ fn run_pipewire(
             }
         })
         .param_changed(move |_, _, id, param| {
-            let Some(param) = param else { return };
-            if id != spa::param::ParamType::Format.as_raw() {
-                tracing::info!("pipewire param {id} changed (not a format)");
-                return;
-            }
-            let Ok((media, sub)) = pw::spa::param::format_utils::parse_format(param) else {
+            let Some(param) = param else {
+                tracing::info!("pipewire param {id} changed to null");
                 return;
             };
-            if media != spa::param::format::MediaType::Video
-                || sub != spa::param::format::MediaSubtype::Raw
-            {
+            tracing::info!("pipewire param {id} changed");
+            if id != spa::param::ParamType::Format.as_raw() {
                 return;
+            }
+            match pw::spa::param::format_utils::parse_format(param) {
+                Ok((media, subtype)) => {
+                    tracing::info!("  format pod: media={media:?} subtype={subtype:?}");
+                }
+                Err(err) => tracing::info!("  parse_format failed: {err:?}"),
             }
             match info_format.lock().expect("format lock").parse(param) {
                 Ok(_) => {
                     let g = info_format.lock().expect("format lock");
                     tracing::info!(
-                        "negotiated {}x{} as {:?}",
+                        "  negotiated {}x{} as {:?}",
                         g.size().width,
                         g.size().height,
                         g.format()
                     );
                 }
-                Err(err) => tracing::error!("VideoInfoRaw parse failed: {err:?}"),
+                Err(err) => tracing::error!("  VideoInfoRaw parse failed: {err:?}"),
             }
         })
         .process(move |stream, _| {
@@ -329,5 +330,63 @@ fn pixel_size(format: VideoFormat) -> Option<usize> {
         | VideoFormat::BGRA
         | VideoFormat::BGRx => Some(4),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pw::spa::param::format::FormatProperties;
+    use pw::spa::param::format::MediaSubtype;
+    use pw::spa::param::format::MediaType;
+    use pw::spa::param::video::VideoFormat;
+
+    /// The gate that used to discard the negotiated format: parse_format has
+    /// to accept it, and VideoInfoRaw::parse has to yield the geometry.
+    #[test]
+    fn negotiated_format_pod_is_accepted_by_both_parsers() {
+        let object = pw::spa::pod::object!(
+            pw::spa::utils::SpaTypes::ObjectParamFormat,
+            pw::spa::param::ParamType::Format,
+            pw::spa::pod::property!(
+                FormatProperties::MediaType,
+                Id, MediaType::Video),
+            pw::spa::pod::property!(
+                FormatProperties::MediaSubtype,
+                Id, MediaSubtype::Raw),
+            pw::spa::pod::property!(
+                FormatProperties::VideoFormat,
+                Id, VideoFormat::BGRx),
+            pw::spa::pod::property!(
+                FormatProperties::VideoSize,
+                Rectangle, pw::spa::utils::Rectangle { width: 1920, height: 1080 }),
+            pw::spa::pod::property!(
+                FormatProperties::VideoFramerate,
+                Fraction, pw::spa::utils::Fraction { num: 30, denom: 1 }),
+        );
+        let bytes = pw::spa::pod::serialize::PodSerializer::serialize(
+            std::io::Cursor::new(Vec::new()),
+            &pw::spa::pod::Value::Object(object),
+        )
+        .expect("serialize")
+        .0
+        .into_inner();
+        let pod = pw::spa::pod::Pod::from_bytes(&bytes).expect("pod");
+
+        let parsed = pw::spa::param::format_utils::parse_format(pod);
+        assert!(
+            parsed.is_ok(),
+            "parse_format rejected the negotiated format: {parsed:?}"
+        );
+        let (media, subtype) = parsed.expect("parsed");
+        assert_eq!(media, MediaType::Video);
+        assert_eq!(subtype, MediaSubtype::Raw);
+
+        let mut info = VideoInfoRaw::new();
+        info.parse(pod)
+            .expect("VideoInfoRaw::parse must accept the negotiated format");
+        assert_eq!(info.size().width, 1920);
+        assert_eq!(info.size().height, 1080);
+        assert_eq!(info.format(), VideoFormat::BGRx);
     }
 }

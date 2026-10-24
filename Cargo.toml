@@ -7,12 +7,16 @@ license = "GPL-3.0-or-later"
 default-run = "gnome-ocr"
 autoexamples = false
 
+[[example]]
+name = "screencast_smoke"
+path = "legacy/examples/screencast_smoke.rs"
+
 [dependencies]
 gtk = { version = "0.11", package = "gtk4", features = ["gnome_48"] }
 
 async-channel = "2"
 
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
 
 ashpd = { version = "0.13", default-features = false, features = ["frontend", "tokio"] }
 pipewire = { version = "0.10", features = ["v0_3_77"] }
