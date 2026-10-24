@@ -19,7 +19,7 @@ use ashpd::desktop::PersistMode;
 use pipewire as pw;
 use pw::{main_loop::MainLoopRc, properties::properties, spa};
 use spa::param::video::{VideoFormat, VideoInfoRaw};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{self, SyncSender};
 
 /// A single captured frame as RGBA8, ready to be encoded as PNG.
 #[derive(Debug)]
@@ -29,24 +29,38 @@ pub struct Frame {
     pub rgba: Vec<u8>,
 }
 
-/// Handle for a running capture session.
+/// A live screen capture.
 ///
-/// Dropping the handle stops capture; the PipeWire thread unwinds on its next
-/// frame and releases the socket.
-pub struct Session {
+/// The portal session, the PipeWire node and the frame stream are created
+/// once and kept for as long as the capture lives. Stopping the recognition
+/// does not tear any of it down, so starting again is instant and cannot
+/// fail the way a fresh portal request can.
+pub struct Capture {
     cancel: Arc<AtomicBool>,
+    frames: mpsc::Receiver<Frame>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    _session: ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>,
 }
 
-impl Session {
-    /// Ask the capture thread to unwind and close the stream.
+impl Capture {
+    /// Take the next frame if one is waiting.
+    pub fn try_next_frame(&self) -> Option<Frame> {
+        self.frames.try_recv().ok()
+    }
+
+    /// Ask the PipeWire thread to unwind and release the socket.
     pub fn stop(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 }
 
-impl Drop for Session {
+impl Drop for Capture {
     fn drop(&mut self) {
         self.stop();
+        // The PipeWire thread leaves its mainloop on the next frame, which
+        // may never come. It is left to finish on its own rather than
+        // joining a thread that could block the shutdown.
+        self.worker.take();
     }
 }
 
@@ -62,10 +76,7 @@ impl Drop for Session {
 /// appear behind the window.
 ///
 /// Returns after the portal handshake, before any frame has arrived.
-pub async fn start(
-    tx: SyncSender<Frame>,
-    restore_token: Option<String>,
-) -> Result<(Session, Option<String>)> {
+pub async fn start(restore_token: Option<String>) -> Result<(Capture, Option<String>)> {
     let proxy = Screencast::new().await?;
     let session = proxy.create_session(Default::default()).await?;
     proxy
@@ -103,10 +114,11 @@ pub async fn start(
         .await?;
 
     let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, frames) = mpsc::sync_channel(2);
     let tx = Arc::new(Mutex::new(Some(tx)));
     let thread_cancel = Arc::clone(&cancel);
 
-    std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name("gnome-ocr-capture".into())
         .spawn(move || {
             if let Err(err) = run_pipewire(fd, node_id, &tx, &thread_cancel) {
@@ -115,7 +127,15 @@ pub async fn start(
         })
         .context("spawn capture thread")?;
 
-    Ok((Session { cancel }, token))
+    Ok((
+        Capture {
+            cancel,
+            frames,
+            worker: Some(worker),
+            _session: session,
+        },
+        token,
+    ))
 }
 
 fn run_pipewire(

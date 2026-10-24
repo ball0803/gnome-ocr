@@ -143,7 +143,7 @@ impl Window {
         let closing = Rc::clone(&window);
         window.root.connect_close_request(move |_| {
             if let Some(pipeline) = closing.pipeline.borrow().as_ref() {
-                pipeline.stop();
+                pipeline.stop_capture();
             }
             gtk::glib::Propagation::Proceed
         });
@@ -155,17 +155,14 @@ impl Window {
     fn wire(self: &Rc<Self>) {
         let owner = Rc::clone(self);
         self.start_button
-            .connect_clicked(move |_| owner.start_pipeline());
+            .connect_clicked(move |_| owner.start_capture());
 
         let owner = Rc::clone(self);
         self.stop_button.connect_clicked(move |_| {
             if let Some(pipeline) = owner.pipeline.borrow().as_ref() {
-                pipeline.stop();
+                pipeline.stop_capture();
             }
             owner.stop_button.set_sensitive(false);
-            // Start stays disabled until the pipeline reports that it has
-            // stopped. Enabling it here would let a click land on a pipeline
-            // that is still winding down, where it is ignored.
             owner.set_status("Stopping…");
         });
 
@@ -193,25 +190,25 @@ impl Window {
         });
     }
 
-    fn start_pipeline(self: &Rc<Self>) {
-        if self.pipeline.borrow().is_some() {
-            self.set_status("The previous capture is still stopping. Try again in a moment.");
-            return;
+    fn start_capture(self: &Rc<Self>) {
+        if self.pipeline.borrow().is_none() {
+            self.clear();
+            let pipeline = Pipeline::start(
+                self.events.clone(),
+                self.japanese_only,
+                std::sync::Arc::clone(&self.restore_token),
+            );
+            *self.pipeline.borrow_mut() = Some(pipeline);
         }
 
-        self.clear();
         self.start_button.set_sensitive(false);
         self.stop_button.set_sensitive(true);
-
         self.root.present();
-        self.set_status("Pick a screen or window in the dialog that opens…");
+        self.set_status("Starting the capture…");
 
-        let pipeline = Pipeline::start(
-            self.events.clone(),
-            self.japanese_only,
-            std::sync::Arc::clone(&self.restore_token),
-        );
-        *self.pipeline.borrow_mut() = Some(pipeline);
+        if let Some(pipeline) = self.pipeline.borrow().as_ref() {
+            pipeline.start_capture();
+        }
     }
 
     fn handle(&self, event: Event) {
@@ -220,6 +217,11 @@ impl Window {
                 self.start_button.set_sensitive(false);
                 self.stop_button.set_sensitive(true);
                 self.set_status("Capturing — new text appears below.");
+            }
+            Event::Stopped => {
+                self.start_button.set_sensitive(true);
+                self.stop_button.set_sensitive(false);
+                self.set_status("Stopped.");
             }
             Event::Fresh { lines, total } => {
                 let joined = lines.join("\n");
@@ -232,12 +234,7 @@ impl Window {
             Event::Failed(err) => {
                 self.set_status(&format!("Problem: {err}"));
             }
-            Event::Stopped => {
-                *self.pipeline.borrow_mut() = None;
-                self.start_button.set_sensitive(true);
-                self.stop_button.set_sensitive(false);
-                self.set_status("Stopped.");
-            }
+
         }
     }
 

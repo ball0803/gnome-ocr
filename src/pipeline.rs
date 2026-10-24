@@ -1,10 +1,9 @@
-//! Capture -> OCR -> text pipeline, running off the GTK main loop.
+//! Capture, recognition and the start/stop commands that drive them.
 //!
-//! Everything expensive happens on a dedicated OS thread: the PipeWire capture
-//! thread, the blocking qocrd child process, and PNG encoding. The thread owns
-//! the capture session, so when the pipeline stops the capture socket is
-//! released too. Events are pushed to the UI over a channel the GTK main
-//! context drains.
+//! The capture is created once and kept for the lifetime of the app. Stopping
+//! only pauses the recognition; the portal session, the PipeWire node and the
+//! frame stream stay up. Starting again therefore needs no portal request and
+//! cannot fail the way a fresh permission request can.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,10 +11,9 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Context;
 use async_channel::Sender;
 
-use crate::capture::{self, Frame};
+use crate::capture::Capture;
 use crate::engine::Engine;
 
 /// One update for the UI.
@@ -27,61 +25,163 @@ pub enum Event {
     Stopped,
 }
 
-/// A running capture+OCR pipeline.
+/// What the UI asks the pipeline to do.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Start,
+    Stop,
+}
+
+/// A running capture and recognition pipeline.
 pub struct Pipeline {
+    commands: mpsc::Sender<Command>,
     shutdown: Arc<AtomicBool>,
 }
 
 impl Pipeline {
-    /// Start capturing and OCRing in the background.
+    /// Start the pipeline thread.
     pub fn start(
         events: Sender<Event>,
         japanese_only: bool,
         restore_token: Arc<Mutex<Option<String>>>,
     ) -> Self {
+        let (commands, inbox) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
 
         std::thread::Builder::new()
             .name("gnome-ocr-pipeline".into())
-            .spawn(move || run(events, thread_shutdown, japanese_only, restore_token))
+            .spawn(move || run(events, inbox, thread_shutdown, japanese_only, restore_token))
             .expect("spawn pipeline thread");
 
-        Self { shutdown }
+        Self {
+            commands,
+            shutdown,
+        }
     }
 
-    /// Stop after the in-flight scan completes.
-    pub fn stop(&self) {
+    /// Begin recognising text. The first call opens the capture.
+    pub fn start_capture(&self) {
+        let _ = self.commands.send(Command::Start);
+    }
+
+    /// Stop recognising text. The capture stays warm so starting again is
+    /// immediate.
+    pub fn stop_capture(&self) {
+        let _ = self.commands.send(Command::Stop);
+    }
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.commands.send(Command::Stop);
     }
 }
 
 fn run(
     events: Sender<Event>,
+    inbox: mpsc::Receiver<Command>,
     shutdown: Arc<AtomicBool>,
     japanese_only: bool,
     restore_token: Arc<Mutex<Option<String>>>,
 ) {
     guarded(&events, || {
-        if let Err(err) = execute(&events, &shutdown, japanese_only, &restore_token) {
-            emit_terminal(&events, Event::Failed(format!("{err}")));
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                emit_terminal(&events, Event::Failed(format!("{err}")));
+                return;
+            }
+        };
+
+        let mut capture: Option<Capture> = None;
+        let mut engine: Option<Engine> = None;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut total: usize = 0;
+        let mut recognising = false;
+
+        while !shutdown.load(Ordering::Relaxed) {
+            match inbox.recv_timeout(Duration::from_millis(50)) {
+                Ok(Command::Start) => {
+                    if capture.is_none() {
+                        tracing::info!("opening the screen capture, this asks for permission");
+                        let token = restore_token.lock().ok().and_then(|token| token.clone());
+                        match runtime.block_on(crate::capture::start(token)) {
+                            Ok((opened, token)) => {
+                                capture = Some(opened);
+                                // The portal consumes the token that was sent,
+                                // so the stored one is replaced even when the
+                                // reply carries none.
+                                if let Ok(mut stored) = restore_token.lock() {
+                                    *stored = token;
+                                }
+                            }
+                            Err(err) => {
+                                emit_terminal(&events, Event::Failed(format!("{err}")));
+                                continue;
+                            }
+                        }
+                    }
+                    if engine.is_none() {
+                        engine = match Engine::spawn(japanese_only, Arc::clone(&shutdown)) {
+                            Ok(engine) => Some(engine),
+                            Err(err) => {
+                                emit_terminal(&events, Event::Failed(format!("{err}")));
+                                continue;
+                            }
+                        };
+                    }
+                    recognising = true;
+                    tracing::info!("capture running");
+                    emit(&events, Event::Started);
+                }
+                Ok(Command::Stop) => {
+                    if recognising {
+                        recognising = false;
+                        emit_terminal(&events, Event::Stopped);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+
+            if !recognising {
+                continue;
+            }
+            let (Some(capture), Some(engine)) = (capture.as_ref(), engine.as_mut()) else {
+                continue;
+            };
+            let Some(frame) = capture.try_next_frame() else {
+                continue;
+            };
+
+            match engine.scan(&frame.rgba, frame.width, frame.height) {
+                Ok(scan) => {
+                    let fresh: Vec<String> = scan
+                        .lines
+                        .into_iter()
+                        .filter(|line| seen.insert(line.clone()))
+                        .collect();
+                    if !fresh.is_empty() {
+                        total += fresh.len();
+                        emit(&events, Event::Fresh { lines: fresh, total });
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("scan failed: {err}");
+                    if shutdown.load(Ordering::Relaxed) {
+                        recognising = false;
+                    }
+                }
+            }
         }
+
+        tracing::info!("pipeline finished after {total} line(s)");
     });
-}
-
-
-/// Resolves once the capture has been asked to stop.
-///
-/// Used to abandon the portal handshake, which otherwise waits for the
-/// permission dialog and would leave the UI waiting forever.
-async fn wait_for_cancel(cancel: Arc<AtomicBool>) {
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(150));
-    loop {
-        ticker.tick().await;
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-    }
 }
 
 /// Runs the pipeline body and always reports that it has stopped.
@@ -106,102 +206,6 @@ impl Drop for StopGuard {
     }
 }
 
-fn execute(
-    events: &Sender<Event>,
-    shutdown: &Arc<AtomicBool>,
-    japanese_only: bool,
-    restore_token: &Arc<Mutex<Option<String>>>,
-) -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for the portal handshake")?;
-
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(2);
-    let token = restore_token.lock().ok().and_then(|token| token.clone());
-    let (session, token) = runtime.block_on(async {
-        tokio::select! {
-            result = capture::start(frame_tx, token) => result.context("start screen capture"),
-            _ = wait_for_cancel(Arc::clone(shutdown)) => {
-                anyhow::bail!("capture cancelled before it started")
-            }
-        }
-    })?;
-    if let Some(token) = token
-        && let Ok(mut stored) = restore_token.lock()
-    {
-        *stored = Some(token);
-    }
-
-    let mut engine = Engine::spawn(japanese_only, Arc::clone(shutdown))?;
-    emit(events, Event::Started);
-    tracing::info!("pipeline running");
-
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut total: usize = 0;
-    let mut frames_seen: usize = 0;
-    let mut consecutive_failures: usize = 0;
-    let mut stall_reported = false;
-    let started_at = std::time::Instant::now();
-
-    while !shutdown.load(Ordering::Relaxed) {
-        let frame = match frame_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(frame) => frame,
-            Err(RecvTimeoutError::Timeout) => {
-                if !stall_reported
-                    && frames_seen == 0
-                    && started_at.elapsed() > Duration::from_secs(8)
-                {
-                    stall_reported = true;
-                    emit(
-                        events,
-                        Event::Failed(
-                            "Capture connected but no frames arrived within 8s. \
-                             See the log for the PipeWire stream state."
-                                .into(),
-                        ),
-                    );
-                }
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-
-        frames_seen += 1;
-
-        match engine.scan(&frame.rgba, frame.width, frame.height) {
-            Ok(scan) => {
-                consecutive_failures = 0;
-                let fresh: Vec<String> = scan
-                    .lines
-                    .into_iter()
-                    .filter(|line| seen.insert(line.clone()))
-                    .collect();
-                if !fresh.is_empty() {
-                    total += fresh.len();
-                    emit(events, Event::Fresh { lines: fresh, total });
-                }
-            }
-            Err(err) => {
-                consecutive_failures += 1;
-                tracing::warn!("scan failed: {err}");
-                if consecutive_failures == 3 {
-                    emit(
-                        events,
-                        Event::Failed(
-                            "qocrd failed on 3 consecutive frames. See the log.".into(),
-                        ),
-                    );
-                }
-            }
-        }
-    }
-
-    drop(session);
-    tracing::info!("pipeline stopped after {total} lines from {frames_seen} frames");
-    Ok(())
-}
-
 /// Sends an event that may be dropped when the UI is behind.
 fn emit(events: &Sender<Event>, event: Event) {
     if let Err(err) = events.try_send(event) {
@@ -218,6 +222,7 @@ fn emit_terminal(events: &Sender<Event>, event: Event) {
         tracing::warn!("UI channel closed, dropping event: {err}");
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,27 +265,6 @@ mod tests {
         sender.join().expect("emit thread");
         let second = recv_with_deadline(&receiver);
         assert!(matches!(second, Event::Stopped));
-    }
-
-    /// The portal handshake waits for a permission dialog, so the stop has
-    /// to be able to abandon it.
-    #[test]
-    fn the_cancel_watcher_notices_a_stop() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let flag = Arc::new(AtomicBool::new(false));
-        let watcher = Arc::clone(&flag);
-        runtime.block_on(async move {
-            let handle = tokio::spawn(wait_for_cancel(watcher));
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            flag.store(true, Ordering::Relaxed);
-            tokio::time::timeout(std::time::Duration::from_secs(2), handle)
-                .await
-                .expect("the watcher must notice the stop")
-                .expect("the watcher must not panic");
-        });
     }
 
     /// Waits for an event, failing rather than hanging when none arrives.
