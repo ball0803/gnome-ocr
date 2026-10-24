@@ -35,6 +35,26 @@ struct ScanLine {
     text: String,
     #[serde(default)]
     aabb: Option<AxisAlignedBox>,
+    #[serde(default)]
+    words: Vec<ScanWord>,
+    #[serde(default)]
+    is_vertical: bool,
+    #[serde(default)]
+    content_type: String,
+    #[serde(default)]
+    direction: String,
+    #[serde(default)]
+    confidence: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanWord {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    aabb: Option<AxisAlignedBox>,
+    #[serde(default)]
+    has_space_after: bool,
 }
 
 /// The axis-aligned bounding box qocrd reports for a line of text.
@@ -53,7 +73,9 @@ struct AxisAlignedBox {
 /// Recognised text from a single frame, with where it was found.
 #[derive(Debug, Default, Clone)]
 pub struct ScanResult {
-    pub detections: Vec<crate::dedupe::Detection>,
+    /// The lines that were recognised, with everything needed to work out
+    /// their order.
+    pub lines: Vec<crate::layout::Line>,
     /// The part of the frame that was scanned, so it can be kept alongside
     /// the text that came from it.
     pub scanned: Option<ScannedImage>,
@@ -67,6 +89,18 @@ pub struct ScannedImage {
     pub rgba: std::sync::Arc<Vec<u8>>,
 }
 
+
+
+/// How sure the engine has to be before a line is taken as text.
+const MIN_CONFIDENCE: f64 = 0.5;
+
+/// Whether the line is text, as opposed to a rule, a picture or a formula.
+fn is_text_content(content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "PRINTED_TEXT" | "HANDWRITTEN_TEXT" | "" | "UNREADABLE_TEXT"
+    )
+}
 
 /// Reads replies from qocrd and hands them over a channel.
 ///
@@ -234,7 +268,7 @@ impl Engine {
             Ok(scan) => {
                 tracing::info!(
                     "scan ok: {width}x{height}, {} line(s) recognised",
-                    scan.detections.len()
+                    scan.lines.len()
                 );
                 let _ = std::fs::remove_file(&self.scratch);
                 Ok(scan)
@@ -308,44 +342,73 @@ impl Engine {
         }
         .context("parse qocrd response")?;
 
-        let mut detections: Vec<crate::dedupe::Detection> = Vec::new();
+        let mut lines: Vec<crate::layout::Line> = Vec::new();
 
         // The lines carry their own geometry, which is what the preview
-        // draws and what tells repeats apart.
+        // draws, what tells repeats apart, and what the order is worked out
+        // from.
         for line in response.lines {
             let text = line.text.trim();
             if text.is_empty() {
                 continue;
             }
             let Some(aabb) = line.aabb else { continue };
-            detections.push(crate::dedupe::Detection {
+            let bounds = crate::layout::Rect {
+                x: aabb.x + origin_x as f64,
+                y: aabb.y + origin_y as f64,
+                width: aabb.width,
+                height: aabb.height,
+            };
+
+            let words = line
+                .words
+                .iter()
+                .filter_map(|word| {
+                    let word_box = word.aabb.as_ref()?;
+                    Some(crate::layout::Word {
+                        text: word.text.clone(),
+                        bounds: crate::layout::Rect {
+                            x: word_box.x + origin_x as f64,
+                            y: word_box.y + origin_y as f64,
+                            width: word_box.width,
+                            height: word_box.height,
+                        },
+                        has_space_after: word.has_space_after,
+                    })
+                })
+                .collect();
+
+            lines.push(crate::layout::Line {
                 text: text.to_owned(),
-                bounds: crate::dedupe::Box {
-                    x: aabb.x + origin_x as f64,
-                    y: aabb.y + origin_y as f64,
-                    width: aabb.width,
-                    height: aabb.height,
-                },
+                bounds,
+                words,
+                is_vertical: line.is_vertical || line.direction == "TOP_TO_BOTTOM",
+                is_right_to_left: line.direction == "RIGHT_TO_LEFT",
+                is_text: is_text_content(&line.content_type) && line.confidence >= MIN_CONFIDENCE,
             });
         }
 
         // Some builds only fill in the flat text.
-        if detections.is_empty() && !response.text.trim().is_empty() {
+        if lines.is_empty() && !response.text.trim().is_empty() {
             for text in response.text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                detections.push(crate::dedupe::Detection {
+                lines.push(crate::layout::Line {
                     text: text.to_owned(),
-                    bounds: crate::dedupe::Box {
+                    bounds: crate::layout::Rect {
                         x: 0.0,
                         y: 0.0,
                         width: 0.0,
                         height: 0.0,
                     },
+                    words: Vec::new(),
+                    is_vertical: false,
+                    is_right_to_left: false,
+                    is_text: true,
                 });
             }
         }
 
         Ok(ScanResult {
-            detections,
+            lines,
             scanned: Some(ScannedImage {
                 width: scanned_width,
                 height: scanned_height,
@@ -540,9 +603,9 @@ mod tests {
         ).expect("spawn qocrd");
         let result = engine.scan(&rgba, width, height).expect("scan should succeed");
 
-        assert!(!result.detections.is_empty(), "qocrd returned no text");
+        assert!(!result.lines.is_empty(), "qocrd returned no text");
         let recognised = result
-            .detections
+            .lines
             .iter()
             .map(|detection| detection.text.as_str())
             .collect::<Vec<_>>()
@@ -564,7 +627,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
         ).expect("spawn qocrd");
         let result = engine.scan(&rgba, width, height).expect("blank frame must not error");
-        assert!(result.detections.is_empty(), "expected no detections, got {:?}", result.detections);
+        assert!(result.lines.is_empty(), "expected no lines, got {:?}", result.lines);
     }
 
     /// qocrd ends every reply with a NUL byte, so the reader has to split
@@ -616,7 +679,7 @@ mod tests {
 
         let result = engine.scan(&rgba, width, height).expect("scan");
         let detection = result
-            .detections
+            .lines
             .first()
             .expect("the text in the right half should be found");
         assert!(

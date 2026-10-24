@@ -15,7 +15,7 @@ use gtk::gdk::prelude::*;
 use gtk::prelude::*;
 use gtk::{cairo, gio, glib};
 
-use crate::dedupe::{Detection, Settings};
+use crate::dedupe::Settings;
 use crate::pipeline::{Event, Pipeline};
 use crate::region::Region;
 
@@ -92,7 +92,7 @@ struct Preview {
     /// The size of the frame the detections were found in.
     frame_size: Cell<(f64, f64)>,
     /// Everything the recogniser found in the last frame.
-    detections: RefCell<Vec<Detection>>,
+    detections: RefCell<Vec<crate::layout::Line>>,
     /// Whether to draw where the text was found.
     show_boxes: Cell<bool>,
 }
@@ -191,18 +191,18 @@ impl Preview {
         crop.y = crop.y.clamp(top, top + height - crop.height);
     }
 
-    /// Where a detection sits in the preview.
-    fn detection_rect(&self, detection: &Detection) -> Option<(f64, f64, f64, f64)> {
+    /// Where a line sits in the preview.
+    fn line_rect(&self, line: &crate::layout::Line) -> Option<(f64, f64, f64, f64)> {
         let (frame_width, frame_height) = self.frame_size.get();
         let (left, top, width, height) = self.rect.get()?;
         if frame_width <= 0.0 || frame_height <= 0.0 {
             return None;
         }
         Some((
-            left + detection.bounds.x / frame_width * width,
-            top + detection.bounds.y / frame_height * height,
-            detection.bounds.width / frame_width * width,
-            detection.bounds.height / frame_height * height,
+            left + line.bounds.x / frame_width * width,
+            top + line.bounds.y / frame_height * height,
+            line.bounds.width / frame_width * width,
+            line.bounds.height / frame_height * height,
         ))
     }
 
@@ -573,9 +573,8 @@ impl Window {
 
             // Where the text was found.
             if preview.show_boxes.get() {
-                for detection in preview.detections.borrow().iter() {
-                    let Some((box_x, box_y, box_width, box_height)) =
-                        preview.detection_rect(detection)
+                for line in preview.detections.borrow().iter() {
+                    let Some((box_x, box_y, box_width, box_height)) = preview.line_rect(line)
                     else {
                         continue;
                     };
@@ -865,17 +864,19 @@ impl Window {
             }
             Event::Scanned {
                 fresh,
-                found,
                 total,
                 image,
+                lines,
+                layout,
             } => {
-                *self.preview.detections.borrow_mut() = found;
+                *self.preview.detections.borrow_mut() = lines;
                 self.canvas.queue_draw();
 
                 if !fresh.is_empty() {
+                    // The blocks are already in reading order.
                     let joined = fresh
                         .iter()
-                        .map(|detection| detection.text.as_str())
+                        .map(|block| block.text())
                         .collect::<Vec<_>>()
                         .join("\n");
                     self.append(&format!("{joined}\n"));
@@ -884,9 +885,9 @@ impl Window {
                     }
                     // The list keeps the picture of the frame the text came
                     // from, so it can be shown next to the text.
-                    self.add_list_entry(image, &joined);
+                    self.add_list_entry(image, &fresh, section_of(&layout, &fresh));
                 }
-                self.set_status(&format!("{total} line(s) captured."));
+                self.set_status(&format!("{total} block(s) captured."));
             }
             Event::Failed(err) => {
                 self.set_status(&format!("Problem: {err}"));
@@ -914,7 +915,12 @@ impl Window {
     }
 
     /// Adds an entry to the list, showing the frame the text came from.
-    fn add_list_entry(&self, image: Option<Vec<u8>>, text: &str) {
+    fn add_list_entry(
+        &self,
+        image: Option<Vec<u8>>,
+        blocks: &[crate::layout::Block],
+        section: Option<crate::layout::Heading>,
+    ) {
         let row = gtk::ListBoxRow::new();
         let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         row_box.set_margin_top(8);
@@ -923,6 +929,13 @@ impl Window {
         row_box.set_margin_end(8);
 
         let left = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        if let Some(section) = section {
+            let heading = gtk::Label::new(Some(&section.text));
+            heading.set_xalign(0.0);
+            heading.add_css_class(&format!("title-{}", section.level));
+            heading.set_wrap(true);
+            left.append(&heading);
+        }
         let timestamp = gtk::Label::new(Some(&timestamp_now()));
         timestamp.set_xalign(0.0);
         timestamp.add_css_class("dim-label");
@@ -941,11 +954,19 @@ impl Window {
         }
         row_box.append(&left);
 
-        let content = gtk::Label::new(Some(text));
-        content.set_xalign(0.0);
-        content.set_yalign(0.0);
-        content.set_wrap(true);
-        content.set_selectable(true);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        for block in blocks {
+            let text = block.text();
+            let label = gtk::Label::new(Some(text));
+            label.set_xalign(0.0);
+            label.set_yalign(0.0);
+            label.set_wrap(true);
+            label.set_selectable(true);
+            if let crate::layout::Block::Heading { level, .. } = block {
+                label.add_css_class(&format!("title-{level}"));
+            }
+            content.append(&label);
+        }
         row_box.append(&content);
 
         row.set_child(Some(&row_box));
@@ -1062,6 +1083,31 @@ fn labelled(text: &str, control: &gtk::SpinButton, tooltip: &str) -> gtk::Box {
     row.append(&label);
     row.append(control);
     row
+}
+
+/// The heading the given blocks sit under, if any.
+fn section_of(
+    layout: &crate::layout::Layout,
+    blocks: &[crate::layout::Block],
+) -> Option<crate::layout::Heading> {
+    let sections = layout.sections();
+    for block in blocks {
+        for section in &sections {
+            match block {
+                crate::layout::Block::Heading { text, .. } => {
+                    if section.heading.as_ref().is_some_and(|heading| &heading.text == text) {
+                        return section.heading.clone();
+                    }
+                }
+                crate::layout::Block::Paragraph { text, .. } => {
+                    if section.paragraphs.iter().any(|paragraph| paragraph == text) {
+                        return section.heading.clone();
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The current local time, as it is shown beside a list entry.

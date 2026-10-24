@@ -86,6 +86,28 @@ behind on disk.
 **Settings** opens a panel with the two thresholds that decide whether two
 detections are in the same place, so they can be tuned while the app runs.
 
+## The order of the text
+
+The recogniser reports where each line was found, but not the order they
+should be read in. That is worked out from the geometry, in the way the
+document analysis literature does it:
+
+- lines are grouped into paragraphs, by their left edge and the gap between
+  them
+- the paragraphs are then cut up recursively at the widest run of
+  whitespace, which recovers the reading order and the structure at once: a
+  cut between columns is a level of the structure, and so is a cut between
+  sections
+- anything running across the whole width, such as a title, is taken out
+  first so that it cannot break the cut
+- a line that is much taller than the rest is a heading, and the size of the
+  text tells the level
+- lines that run downwards, which is how Japanese is often written, are kept
+  apart and read from the right
+
+The thresholds are all relative to the size of the ordinary text, so they
+hold at any resolution.
+
 ## What counts as new text
 
 Text that is still on screen gets recognised again on every frame, so it is

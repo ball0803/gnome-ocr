@@ -22,16 +22,19 @@ pub enum Event {
     Started,
     /// Text that was recognised, and where it was found.
     Scanned {
-        /// The detections that had not been seen before.
-        fresh: Vec<crate::dedupe::Detection>,
-        /// Everything found in this frame.
-        found: Vec<crate::dedupe::Detection>,
+        /// The blocks that had not been seen before, in reading order.
+        fresh: Vec<crate::layout::Block>,
         /// How many new detections there have been in total.
         total: usize,
         /// A picture of the part of the frame the new text came from. It is
         /// only made when there is new text, so the frames that carried
         /// nothing are never kept.
         image: Option<Vec<u8>>,
+        /// The lines that were recognised, with where they were found.
+        lines: Vec<crate::layout::Line>,
+        /// Everything that was found, in reading order and with its
+        /// structure.
+        layout: crate::layout::Layout,
     },
     Failed(String),
     Stopped,
@@ -263,13 +266,23 @@ fn run(
 
             match engine.scan(&frame.rgba, frame.width, frame.height) {
                 Ok(scan) => {
+                    // The order and the structure of the text are worked out
+                    // from where each line was found.
+                    let layout = crate::layout::analyse(&scan.lines);
                     let mut fresh = Vec::new();
-                    let mut found = Vec::new();
-                    for detection in scan.detections {
+                    for block in &layout.blocks {
+                        let detection = crate::dedupe::Detection {
+                            text: block.text().to_owned(),
+                            bounds: crate::dedupe::Box {
+                                x: block.bounds().x,
+                                y: block.bounds().y,
+                                width: block.bounds().width,
+                                height: block.bounds().height,
+                            },
+                        };
                         if history.is_new(&detection) {
-                            fresh.push(detection.clone());
+                            fresh.push(block.clone());
                         }
-                        found.push(detection);
                     }
                     total += fresh.len();
                     // The picture is only made when there is new text, so
@@ -290,9 +303,10 @@ fn run(
                         &events,
                         Event::Scanned {
                             fresh,
-                            found,
                             total,
                             image,
+                            lines: scan.lines,
+                            layout,
                         },
                     );
                 }

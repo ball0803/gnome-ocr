@@ -7,6 +7,7 @@
 mod capture;
 mod dedupe;
 mod engine;
+mod layout;
 mod paths;
 mod pipeline;
 mod preview;
