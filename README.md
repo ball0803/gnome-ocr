@@ -51,10 +51,13 @@ The binary lands at `target/release/gnome-ocr`.
 Press **Start OCR** and approve the capture dialog, then choose a screen or a
 window in it. Recognised text starts filling the window.
 
-The capture stays open while the app runs. Stopping only pauses the
-recognition, so starting again is immediate and never asks for permission a
-second time. To pick a different screen or window, quit the app and start it
-again.
+Stopping is a real stop: the portal session is closed, the compositor stops
+sharing, and the stream and the OCR daemon are released. Starting again opens
+a new capture, which the portal may satisfy from the grant it already holds.
+
+Stopping the share from the system menu ends the session from the
+compositor's side. The app notices and says so, and the next start asks for
+a new capture.
 
 Toggle **Auto-copy new text** to control whether new lines are copied to your
 clipboard; **Copy all** copies everything shown; **Clear** empties the view

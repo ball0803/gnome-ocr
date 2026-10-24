@@ -144,9 +144,39 @@ fn run(
                         recognising = false;
                         emit_terminal(&events, Event::Stopped);
                     }
+                    // A real stop: the portal session is closed, which tells
+                    // the compositor to stop sharing, and the daemon and the
+                    // stream are released with it.
+                    if let Some(closed) = capture.take() {
+                        runtime.block_on(closed.close_session());
+                        drop(closed);
+                    }
+                    engine = None;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
+            }
+
+            // The compositor can end the share on its own, from the system
+            // menu. The stream then dies, and the capture has to be replaced
+            // before the next start.
+            if let Some(current) = capture.as_ref()
+                && !current.is_alive()
+            {
+                tracing::info!("the capture was stopped outside the app");
+                capture = None;
+                engine = None;
+                recognising = false;
+                emit_terminal(
+                    &events,
+                    Event::Failed(
+                        "The screen share was stopped from the system menu. \
+                         Press Start to share again."
+                            .into(),
+                    ),
+                );
+                emit_terminal(&events, Event::Stopped);
+                continue;
             }
 
             if !recognising {

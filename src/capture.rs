@@ -37,15 +37,30 @@ pub struct Frame {
 /// fail the way a fresh portal request can.
 pub struct Capture {
     cancel: Arc<AtomicBool>,
+    dead: Arc<AtomicBool>,
     frames: mpsc::Receiver<Frame>,
     worker: Option<std::thread::JoinHandle<()>>,
-    _session: ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>,
+    session: ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>,
 }
 
 impl Capture {
     /// Take the next frame if one is waiting.
     pub fn try_next_frame(&self) -> Option<Frame> {
         self.frames.try_recv().ok()
+    }
+
+    /// False once the capture has been torn down, either by this app or by
+    /// the compositor when the user stops the share from the system menu.
+    pub fn is_alive(&self) -> bool {
+        !self.dead.load(Ordering::Relaxed)
+    }
+
+    /// Releases the portal session, which tells the compositor to stop
+    /// sharing and frees the screen.
+    pub async fn close_session(&self) {
+        if let Err(err) = self.session.close().await {
+            tracing::warn!("closing the portal session failed: {err}");
+        }
     }
 
     /// Ask the PipeWire thread to unwind and release the socket.
@@ -77,6 +92,7 @@ impl Drop for Capture {
 ///
 /// Returns after the portal handshake, before any frame has arrived.
 pub async fn start(restore_token: Option<String>) -> Result<(Capture, Option<String>)> {
+    tracing::info!("asking the portal for a screen capture");
     let proxy = Screencast::new().await?;
     let session = proxy.create_session(Default::default()).await?;
     proxy
@@ -114,15 +130,18 @@ pub async fn start(restore_token: Option<String>) -> Result<(Capture, Option<Str
         .await?;
 
     let cancel = Arc::new(AtomicBool::new(false));
+    let dead = Arc::new(AtomicBool::new(false));
     let (tx, frames) = mpsc::sync_channel(2);
     let tx = Arc::new(Mutex::new(Some(tx)));
     let thread_cancel = Arc::clone(&cancel);
+    let thread_dead = Arc::clone(&dead);
 
     let worker = std::thread::Builder::new()
         .name("gnome-ocr-capture".into())
         .spawn(move || {
-            if let Err(err) = run_pipewire(fd, node_id, &tx, &thread_cancel) {
+            if let Err(err) = run_pipewire(fd, node_id, &tx, &thread_cancel, &thread_dead) {
                 tracing::error!("capture thread stopped: {err}");
+                thread_dead.store(true, Ordering::Relaxed);
             }
         })
         .context("spawn capture thread")?;
@@ -130,9 +149,10 @@ pub async fn start(restore_token: Option<String>) -> Result<(Capture, Option<Str
     Ok((
         Capture {
             cancel,
+            dead,
             frames,
             worker: Some(worker),
-            _session: session,
+            session,
         },
         token,
     ))
@@ -143,6 +163,7 @@ fn run_pipewire(
     node_id: u32,
     tx: &Arc<Mutex<Option<SyncSender<Frame>>>>,
     cancel: &Arc<AtomicBool>,
+    dead: &Arc<AtomicBool>,
 ) -> Result<()> {
     pw::init();
     let mainloop = MainLoopRc::new(None).context("MainLoopRc::new")?;
@@ -165,6 +186,7 @@ fn run_pipewire(
     let info_size = Arc::clone(&info);
     let tx_frame = Arc::clone(tx);
     let cancel_cb = Arc::clone(cancel);
+    let dead_cb = Arc::clone(dead);
     let mainloop_cb = mainloop.clone();
     let announced_frame = Arc::new(AtomicBool::new(false));
 
@@ -173,6 +195,7 @@ fn run_pipewire(
         .state_changed(move |_, _, old, new| {
             if matches!(new, pw::stream::StreamState::Error(_)) {
                 tracing::error!("pipewire stream entered error state: {old:?} -> {new:?}");
+                dead_cb.store(true, Ordering::Relaxed);
             } else {
                 tracing::info!("pipewire state: {old:?} -> {new:?}");
             }

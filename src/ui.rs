@@ -233,6 +233,10 @@ impl Window {
             }
             Event::Failed(err) => {
                 self.set_status(&format!("Problem: {err}"));
+                // A failure means there is no capture running, so the start
+                // button has to come back.
+                self.start_button.set_sensitive(true);
+                self.stop_button.set_sensitive(false);
             }
 
         }
