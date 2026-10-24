@@ -149,7 +149,9 @@ impl Window {
                 pipeline.stop();
             }
             owner.stop_button.set_sensitive(false);
-            owner.start_button.set_sensitive(true);
+            // Start stays disabled until the pipeline reports that it has
+            // stopped. Enabling it here would let a click land on a pipeline
+            // that is still winding down, where it is ignored.
             owner.set_status("Stopping…");
         });
 
@@ -179,6 +181,7 @@ impl Window {
 
     fn start_pipeline(self: &Rc<Self>) {
         if self.pipeline.borrow().is_some() {
+            self.set_status("The previous capture is still stopping. Try again in a moment.");
             return;
         }
 
@@ -209,13 +212,12 @@ impl Window {
             }
             Event::Failed(err) => {
                 self.set_status(&format!("Problem: {err}"));
-                self.start_button.set_sensitive(true);
-                self.stop_button.set_sensitive(false);
             }
             Event::Stopped => {
                 *self.pipeline.borrow_mut() = None;
                 self.start_button.set_sensitive(true);
                 self.stop_button.set_sensitive(false);
+                self.set_status("Stopped.");
             }
         }
     }

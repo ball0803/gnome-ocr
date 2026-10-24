@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 use anyhow::{Context, Result};
 use image::{ImageBuffer, ImageFormat, Rgba};
@@ -40,11 +40,14 @@ pub struct ScanResult {
     pub lines: Vec<String>,
 }
 
+/// How long to wait for qocrd to answer a scan.
+const SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// The qocrd child process. Owns its own teardown so it can be swapped out.
 struct Process {
     child: Child,
     stdin: ChildStdin,
-    stdout: ChildStdout,
+    responses: std::sync::mpsc::Receiver<Result<ScanFileResponse, serde_json::Error>>,
 }
 
 impl Process {
@@ -68,10 +71,28 @@ impl Process {
 
         let stdin = child.stdin.take().context("qocrd stdin")?;
         let stdout = child.stdout.take().context("qocrd stdout")?;
+
+        // A reader thread owns the output stream and hands parsed replies
+        // over a channel, so a scan can wait with a deadline instead of
+        // blocking forever on a daemon that stopped answering.
+        let (sender, responses) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("qocrd-reader".into())
+            .spawn(move || {
+                let replies =
+                    serde_json::Deserializer::from_reader(stdout).into_iter::<ScanFileResponse>();
+                for reply in replies {
+                    if sender.send(reply).is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("spawn qocrd reader thread")?;
+
         Ok(Self {
             child,
             stdin,
-            stdout,
+            responses,
         })
     }
 }
@@ -136,8 +157,8 @@ impl Engine {
                     rgba.len(),
                     mean_luma(rgba)
                 );
-                self.process = Process::spawn()?;
                 let _ = std::fs::remove_file(&self.scratch);
+                self.process = Process::spawn()?;
                 Err(err)
             }
         }
@@ -155,14 +176,22 @@ impl Engine {
             .context("write command to qocrd")?;
         self.process.stdin.flush().context("flush qocrd stdin")?;
 
-        // qocrd terminates each reply with a NUL byte, so read exactly one
-        // JSON value. Trying to read a second value lands on that NUL and
-        // fails to parse.
-        let response = serde_json::Deserializer::from_reader(&mut self.process.stdout)
-            .into_iter::<ScanFileResponse>()
-            .next()
-            .context("qocrd closed stdout without replying")?
-            .context("parse qocrd response")?;
+        // qocrd terminates each reply with a NUL byte, so exactly one JSON
+        // value is read per command. Trying to read a second lands on that
+        // NUL and fails to parse.
+        let response = match self.process.responses.recv_timeout(SCAN_TIMEOUT) {
+            Ok(response) => response,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(anyhow::anyhow!(
+                    "qocrd did not answer within {}s",
+                    SCAN_TIMEOUT.as_secs()
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow::anyhow!("qocrd closed its output"));
+            }
+        }
+        .context("parse qocrd response")?;
 
         let mut lines: Vec<String> = Vec::new();
         if !response.text.trim().is_empty() {

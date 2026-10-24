@@ -19,6 +19,7 @@ use crate::capture::{self, Frame};
 use crate::engine::Engine;
 
 /// One update for the UI.
+#[derive(Debug)]
 pub enum Event {
     Started,
     Fresh { lines: Vec<String>, total: usize },
@@ -52,10 +53,33 @@ impl Pipeline {
 }
 
 fn run(events: Sender<Event>, shutdown: Arc<AtomicBool>, japanese_only: bool) {
-    if let Err(err) = execute(&events, &shutdown, japanese_only) {
-        emit(&events, Event::Failed(format!("{err}")));
+    guarded(&events, || {
+        if let Err(err) = execute(&events, &shutdown, japanese_only) {
+            emit_terminal(&events, Event::Failed(format!("{err}")));
+        }
+    });
+}
+
+/// Runs the pipeline body and always reports that it has stopped.
+fn guarded(events: &Sender<Event>, body: impl FnOnce()) {
+    let _guard = StopGuard {
+        events: events.clone(),
+    };
+    body();
+}
+
+/// Reports that the pipeline has ended, even if the thread unwound.
+///
+/// Without this a panic would leave the UI holding a dead pipeline and the
+/// capture could never be started again.
+struct StopGuard {
+    events: Sender<Event>,
+}
+
+impl Drop for StopGuard {
+    fn drop(&mut self) {
+        emit_terminal(&self.events, Event::Stopped);
     }
-    emit(&events, Event::Stopped);
 }
 
 fn execute(
@@ -142,8 +166,75 @@ fn execute(
     Ok(())
 }
 
+/// Sends an event that may be dropped when the UI is behind.
 fn emit(events: &Sender<Event>, event: Event) {
     if let Err(err) = events.try_send(event) {
+        tracing::warn!("UI channel full, dropping event: {err}");
+    }
+}
+
+/// Sends an event the UI must not miss.
+///
+/// Terminal events decide whether the capture can be started again, so
+/// they wait for room in the channel rather than being dropped.
+fn emit_terminal(events: &Sender<Event>, event: Event) {
+    if let Err(err) = events.send_blocking(event) {
         tracing::warn!("UI channel closed, dropping event: {err}");
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The capture can only be started again once the pipeline reports that
+    /// it stopped, so that report has to survive a thread that unwinds.
+    #[test]
+    fn stopping_is_reported_even_when_the_thread_unwinds() {
+        let (sender, receiver) = async_channel::bounded(4);
+        let events = sender.clone();
+
+        let outcome = std::thread::spawn(move || {
+            guarded(&events, || panic!("simulated failure inside the pipeline thread"));
+        })
+        .join();
+
+        assert!(outcome.is_err(), "the thread should have panicked");
+        match recv_with_deadline(&receiver) {
+            Event::Stopped => {}
+            other => panic!("expected Stopped, got {other:?}"),
+        }
+    }
+
+    /// Terminal events must not be dropped when the UI is behind, because
+    /// they are what re-enables the start button.
+    #[test]
+    fn a_terminal_event_survives_a_full_channel() {
+        let (sender, receiver) = async_channel::bounded(1);
+        sender.try_send(Event::Started).expect("first event fits");
+
+        let sender_for_thread = sender.clone();
+        let sender = std::thread::spawn(move || {
+            emit_terminal(&sender_for_thread, Event::Stopped);
+        });
+
+        // The channel is full, so the terminal event has to wait for room.
+        let first = receiver.recv_blocking().expect("first event");
+        assert!(matches!(first, Event::Started));
+
+        sender.join().expect("emit thread");
+        let second = recv_with_deadline(&receiver);
+        assert!(matches!(second, Event::Stopped));
+    }
+
+    /// Waits for an event, failing rather than hanging when none arrives.
+    fn recv_with_deadline(receiver: &async_channel::Receiver<Event>) -> Event {
+        let (sender, done) = std::sync::mpsc::channel();
+        let receiver = receiver.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(receiver.recv_blocking());
+        });
+        done.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a terminal event must arrive")
+            .expect("the channel must stay open")
     }
 }
