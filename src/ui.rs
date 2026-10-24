@@ -108,6 +108,17 @@ impl Preview {
         }
     }
 
+    /// Replaces the image that is shown.
+    ///
+    /// The scaled copy belongs to the image it was made from, so it is
+    /// dropped here. Keeping it would leave the preview showing the first
+    /// frame, because every later frame has the same size and would be
+    /// served from the cache.
+    fn set_surface(&self, surface: cairo::ImageSurface) {
+        *self.surface.borrow_mut() = Some(surface);
+        *self.scaled.borrow_mut() = None;
+    }
+
     /// The frame scaled to the size it is drawn at, built once per size.
     fn scaled_surface(&self, width: i32, height: i32) -> Option<cairo::ImageSurface> {
         let mut cached = self.scaled.borrow_mut();
@@ -842,7 +853,7 @@ impl Window {
                     .frame_size
                     .set((frame_width as f64, frame_height as f64));
                 if let Ok(surface) = cairo::ImageSurface::create_from_png(&mut &png[..]) {
-                    *self.preview.surface.borrow_mut() = Some(surface);
+                    self.preview.set_surface(surface);
                     self.canvas.queue_draw();
                 }
             }
@@ -963,6 +974,40 @@ mod tests {
 
     /// GtkGestureDrag reports the offset from the point the drag started at,
     /// so the position of the pointer is the start plus that offset.
+    #[test]
+    /// The scaled copy of the preview was cached by size alone, so every
+    /// later frame of the same size was served from the cache and the
+    /// preview stayed on the first frame.
+    #[test]
+    fn a_new_frame_replaces_the_one_that_was_shown() {
+        use gtk::cairo;
+
+        let preview = Preview::new();
+
+        let red = cairo::ImageSurface::create(cairo::Format::ARgb32, 4, 4).expect("surface");
+        {
+            let context = cairo::Context::new(&red).expect("context");
+            context.set_source_rgb(1.0, 0.0, 0.0);
+            context.paint().expect("paint");
+        }
+        preview.set_surface(red);
+
+        preview.scaled_surface(4, 4).expect("scaled");
+        assert!(
+            preview.scaled.borrow().is_some(),
+            "the scaled copy should be cached"
+        );
+
+        // The next frame is the same size, so the cache would match it and
+        // the old frame would keep being shown.
+        let green = cairo::ImageSurface::create(cairo::Format::ARgb32, 4, 4).expect("surface");
+        preview.set_surface(green);
+        assert!(
+            preview.scaled.borrow().is_none(),
+            "the scaled copy of the old frame must be dropped"
+        );
+    }
+
     #[test]
     fn the_pointer_position_is_the_start_plus_the_offset() {
         let start = (120.0f64, 240.0f64);
