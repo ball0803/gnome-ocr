@@ -81,6 +81,9 @@ struct Preview {
     /// Where the frame was last drawn, so pointer positions can be turned
     /// into a position in the frame.
     rect: Cell<Option<(f64, f64, f64, f64)>>,
+    /// Where the drag started. GtkGestureDrag reports the offset from this
+    /// point, so the position is the start plus the offset.
+    start: Cell<Option<(f64, f64)>>,
 }
 
 impl Preview {
@@ -91,6 +94,7 @@ impl Preview {
             crop: RefCell::new(None),
             drag: RefCell::new(None),
             rect: Cell::new(None),
+            start: Cell::new(None),
         }
     }
 
@@ -516,6 +520,9 @@ impl Window {
 
         let begin = Rc::clone(&self.preview);
         drag.connect_drag_begin(move |_gesture, x, y| {
+            // The position where the button went down, relative to the
+            // widget allocation.
+            begin.start.set(Some((x, y)));
             if let Some(handle) = begin.handle_at(x, y) {
                 let start = begin.crop.borrow().unwrap_or_default();
                 *begin.drag.borrow_mut() = Some(Drag::Resize { handle, start });
@@ -533,7 +540,12 @@ impl Window {
 
         let update = Rc::clone(&self.preview);
         let owner = Rc::clone(self);
-        drag.connect_drag_update(move |_gesture, x, y| {
+        drag.connect_drag_update(move |_gesture, offset_x, offset_y| {
+            // The drag reports the offset from the point it started at, so
+            // the position is the start plus that offset.
+            let (start_x, start_y) = update.start.get().unwrap_or((0.0, 0.0));
+            let (x, y) = (start_x + offset_x, start_y + offset_y);
+
             let current = update.drag.borrow().clone();
             match current {
                 Some(Drag::New { anchor }) => {
@@ -566,8 +578,9 @@ impl Window {
         });
 
         let owner = Rc::clone(self);
-        drag.connect_drag_end(move |_gesture, _x, _y| {
+        drag.connect_drag_end(move |_gesture, _offset_x, _offset_y| {
             *owner.preview.drag.borrow_mut() = None;
+            owner.preview.start.set(None);
             owner.publish_region();
         });
 
@@ -790,6 +803,16 @@ mod tests {
             width,
             height,
         }
+    }
+
+    /// GtkGestureDrag reports the offset from the point the drag started at,
+    /// so the position of the pointer is the start plus that offset.
+    #[test]
+    fn the_pointer_position_is_the_start_plus_the_offset() {
+        let start = (120.0f64, 240.0f64);
+        let offset = (35.0f64, -15.0f64);
+        let (x, y) = (start.0 + offset.0, start.1 + offset.1);
+        assert_eq!((x, y), (155.0, 225.0));
     }
 
     /// The corner of the crop is the point the pointer went down on, with no
