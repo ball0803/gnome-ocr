@@ -30,6 +30,9 @@ pub enum Event {
 enum Command {
     Start,
     Stop,
+    /// Release the current capture and open a new one, asking the portal for
+    /// the source again instead of restoring the previous choice.
+    ChangeSource,
 }
 
 /// A running capture and recognition pipeline.
@@ -65,10 +68,15 @@ impl Pipeline {
         let _ = self.commands.send(Command::Start);
     }
 
-    /// Stop recognising text. The capture stays warm so starting again is
-    /// immediate.
+    /// Stop recognising text and release the capture.
     pub fn stop_capture(&self) {
         let _ = self.commands.send(Command::Stop);
+    }
+
+    /// Capture something else. The portal asks which screen or window to
+    /// share instead of restoring the previous choice.
+    pub fn change_source(&self) {
+        let _ = self.commands.send(Command::ChangeSource);
     }
 }
 
@@ -105,56 +113,63 @@ fn run(
         let mut recognising = false;
 
         while !shutdown.load(Ordering::Relaxed) {
+            let mut begin = false;
             match inbox.recv_timeout(Duration::from_millis(50)) {
-                Ok(Command::Start) => {
-                    if capture.is_none() {
-                        tracing::info!("opening the screen capture, this asks for permission");
-                        let token = restore_token.lock().ok().and_then(|token| token.clone());
-                        match runtime.block_on(crate::capture::start(token)) {
-                            Ok((opened, token)) => {
-                                capture = Some(opened);
-                                // The portal consumes the token that was sent,
-                                // so the stored one is replaced even when the
-                                // reply carries none.
-                                if let Ok(mut stored) = restore_token.lock() {
-                                    *stored = token;
-                                }
-                            }
-                            Err(err) => {
-                                emit_terminal(&events, Event::Failed(format!("{err}")));
-                                continue;
-                            }
-                        }
+                Ok(Command::Start) => begin = true,
+                Ok(Command::ChangeSource) => {
+                    // Release the current capture and forget the grant, so
+                    // the portal asks which screen or window to share
+                    // instead of restoring the previous choice.
+                    release_capture(&runtime, &mut capture, &mut engine);
+                    if let Ok(mut stored) = restore_token.lock() {
+                        *stored = None;
                     }
-                    if engine.is_none() {
-                        engine = match Engine::spawn(japanese_only, Arc::clone(&shutdown)) {
-                            Ok(engine) => Some(engine),
-                            Err(err) => {
-                                emit_terminal(&events, Event::Failed(format!("{err}")));
-                                continue;
-                            }
-                        };
-                    }
-                    recognising = true;
-                    tracing::info!("capture running");
-                    emit(&events, Event::Started);
+                    recognising = false;
+                    begin = true;
                 }
                 Ok(Command::Stop) => {
                     if recognising {
                         recognising = false;
                         emit_terminal(&events, Event::Stopped);
                     }
-                    // A real stop: the portal session is closed, which tells
-                    // the compositor to stop sharing, and the daemon and the
-                    // stream are released with it.
-                    if let Some(closed) = capture.take() {
-                        runtime.block_on(closed.close_session());
-                        drop(closed);
-                    }
-                    engine = None;
+                    release_capture(&runtime, &mut capture, &mut engine);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
+            }
+
+            if begin {
+                if capture.is_none() {
+                    tracing::info!("opening the screen capture, this asks for permission");
+                    let token = restore_token.lock().ok().and_then(|token| token.clone());
+                    match runtime.block_on(crate::capture::start(token)) {
+                        Ok((opened, token)) => {
+                            capture = Some(opened);
+                            // The portal consumes the token that was sent,
+                            // so the stored one is replaced even when the
+                            // reply carries none.
+                            if let Ok(mut stored) = restore_token.lock() {
+                                *stored = token;
+                            }
+                        }
+                        Err(err) => {
+                            emit_terminal(&events, Event::Failed(format!("{err}")));
+                            continue;
+                        }
+                    }
+                }
+                if engine.is_none() {
+                    engine = match Engine::spawn(japanese_only, Arc::clone(&shutdown)) {
+                        Ok(engine) => Some(engine),
+                        Err(err) => {
+                            emit_terminal(&events, Event::Failed(format!("{err}")));
+                            continue;
+                        }
+                    };
+                }
+                recognising = true;
+                tracing::info!("capture running");
+                emit(&events, Event::Started);
             }
 
             // The compositor can end the share on its own, from the system
@@ -212,6 +227,19 @@ fn run(
 
         tracing::info!("pipeline finished after {total} line(s)");
     });
+}
+
+
+/// Closes the portal session and releases the stream and the daemon.
+fn release_capture(
+    runtime: &tokio::runtime::Runtime,
+    capture: &mut Option<Capture>,
+    engine: &mut Option<Engine>,
+) {
+    if let Some(closed) = capture.take() {
+        runtime.block_on(closed.close_session());
+    }
+    *engine = None;
 }
 
 /// Runs the pipeline body and always reports that it has stopped.

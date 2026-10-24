@@ -35,6 +35,7 @@ struct Window {
     buffer: gtk::TextBuffer,
     start_button: gtk::Button,
     stop_button: gtk::Button,
+    change_button: gtk::Button,
     copy_button: gtk::Button,
     clear_button: gtk::Button,
     auto_copy: gtk::Switch,
@@ -58,6 +59,11 @@ impl Window {
         let start_button = pill("Start OCR", Some("suggested-action"));
         let stop_button = pill("Stop", Some("destructive-action"));
         stop_button.set_sensitive(false);
+        let change_button = pill("Change window", None);
+        change_button.set_tooltip_text(Some(
+            "Capture a different screen or window. The portal asks which one to use.",
+        ));
+        change_button.set_sensitive(false);
         let copy_button = pill("Copy all", None);
         let clear_button = pill("Clear", None);
 
@@ -74,6 +80,7 @@ impl Window {
         toolbar.set_margin_end(12);
         toolbar.append(&start_button);
         toolbar.append(&stop_button);
+        toolbar.append(&change_button);
         toolbar.append(&gtk::Label::new(Some("Auto-copy new text")));
         toolbar.append(&auto_copy);
         toolbar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
@@ -123,6 +130,7 @@ impl Window {
             buffer,
             start_button,
             stop_button,
+            change_button,
             copy_button,
             clear_button,
             auto_copy,
@@ -167,6 +175,10 @@ impl Window {
         });
 
         let owner = Rc::clone(self);
+        self.change_button
+            .connect_clicked(move |_| owner.change_source());
+
+        let owner = Rc::clone(self);
         self.copy_button
             .connect_clicked(move |_| owner.copy_all());
 
@@ -188,6 +200,16 @@ impl Window {
                 owner.handle(event);
             }
         });
+    }
+
+    fn change_source(self: &Rc<Self>) {
+        if self.pipeline.borrow().is_none() {
+            return;
+        }
+        self.set_status("Choose the new screen or window in the dialog…");
+        if let Some(pipeline) = self.pipeline.borrow().as_ref() {
+            pipeline.change_source();
+        }
     }
 
     fn start_capture(self: &Rc<Self>) {
@@ -216,11 +238,13 @@ impl Window {
             Event::Started => {
                 self.start_button.set_sensitive(false);
                 self.stop_button.set_sensitive(true);
+                self.change_button.set_sensitive(true);
                 self.set_status("Capturing — new text appears below.");
             }
             Event::Stopped => {
                 self.start_button.set_sensitive(true);
                 self.stop_button.set_sensitive(false);
+                self.change_button.set_sensitive(false);
                 self.set_status("Stopped.");
             }
             Event::Fresh { lines, total } => {

@@ -59,6 +59,10 @@ Stopping the share from the system menu ends the session from the
 compositor's side. The app notices and says so, and the next start asks for
 a new capture.
 
+**Change window** captures something else: the current share is ended and the
+portal asks again which screen or window to use, instead of restoring the
+previous choice.
+
 Toggle **Auto-copy new text** to control whether new lines are copied to your
 clipboard; **Copy all** copies everything shown; **Clear** empties the view
 and resets the de-duplication set.
