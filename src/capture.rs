@@ -205,7 +205,6 @@ fn run_pipewire(
             } else {
                 width as usize * pixel_size
             };
-            let row_bytes = width as usize * pixel_size;
             let end = offset.saturating_add(chunk_size).min(source.len());
             let Some(source) = source.get(offset..end) else {
                 return;
@@ -214,36 +213,10 @@ fn run_pipewire(
                 return;
             }
 
-            let mut rgba = vec![0u8; width as usize * height as usize * 4];
-            for y in 0..height as usize {
-                let row_start = y * stride;
-                if row_start + row_bytes > source.len() {
-                    break;
-                }
-                let row = &source[row_start..row_start + row_bytes];
-                for x in 0..width as usize {
-                    let input = &row[x * pixel_size..];
-                    let output = &mut rgba[(y * width as usize + x) * 4..];
-                    // The fourth byte of an "x" format is padding, not alpha.
-                    // Reading it as alpha yields a transparent image when the
-                    // compositor leaves it zero.
-                    match format {
-                        VideoFormat::RGB | VideoFormat::RGBx => {
-                            output.copy_from_slice(&[input[0], input[1], input[2], 0xFF]);
-                        }
-                        VideoFormat::RGBA => {
-                            output.copy_from_slice(&[input[0], input[1], input[2], input[3]]);
-                        }
-                        VideoFormat::BGR | VideoFormat::BGRx => {
-                            output.copy_from_slice(&[input[2], input[1], input[0], 0xFF]);
-                        }
-                        VideoFormat::BGRA => {
-                            output.copy_from_slice(&[input[2], input[1], input[0], input[3]]);
-                        }
-                        _ => return,
-                    }
-                }
-            }
+            let Some(rgba) = convert_frame(source, width, height, stride, pixel_size, format)
+            else {
+                return;
+            };
 
             let guard = tx_frame.lock().expect("tx lock");
             let Some(sender) = guard.as_ref() else { return };
@@ -328,6 +301,59 @@ fn apply_negotiated_format(
     Ok((guard.size().width, guard.size().height, guard.format()))
 }
 
+
+/// Converts a mapped PipeWire frame into RGBA8.
+///
+/// Returns None when the buffer is too short for the geometry or the format
+/// cannot be read. Nothing here may panic: this runs inside a PipeWire
+/// callback, where a panic aborts the process.
+fn convert_frame(
+    source: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    pixel_size: usize,
+    format: VideoFormat,
+) -> Option<Vec<u8>> {
+    let row_bytes = width as usize * pixel_size;
+    if source.len() < stride.saturating_mul(height as usize) {
+        return None;
+    }
+
+    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    for y in 0..height as usize {
+        let row_start = y * stride;
+        if row_start + row_bytes > source.len() {
+            break;
+        }
+        let row = &source[row_start..row_start + row_bytes];
+        for x in 0..width as usize {
+            let input = &row[x * pixel_size..x * pixel_size + pixel_size];
+            let start = (y * width as usize + x) * 4;
+            let output = &mut rgba[start..start + 4];
+            // The fourth byte of an "x" format is padding, not alpha.
+            // Reading it as alpha yields a transparent image when the
+            // compositor leaves it zero.
+            match format {
+                VideoFormat::RGB | VideoFormat::RGBx => {
+                    output.copy_from_slice(&[input[0], input[1], input[2], 0xFF]);
+                }
+                VideoFormat::RGBA => {
+                    output.copy_from_slice(&[input[0], input[1], input[2], input[3]]);
+                }
+                VideoFormat::BGR | VideoFormat::BGRx => {
+                    output.copy_from_slice(&[input[2], input[1], input[0], 0xFF]);
+                }
+                VideoFormat::BGRA => {
+                    output.copy_from_slice(&[input[2], input[1], input[0], input[3]]);
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some(rgba)
+}
+
 /// Bytes per pixel for a negotiated format, or None if it cannot be read.
 fn pixel_size(format: VideoFormat) -> Option<usize> {
     match format {
@@ -347,6 +373,57 @@ mod tests {
     use pw::spa::param::format::MediaSubtype;
     use pw::spa::param::format::MediaType;
     use pw::spa::param::video::VideoFormat;
+
+    /// A BGRx frame must come out as RGBA with the red and blue channels
+    /// swapped, and with alpha forced opaque even though the fourth byte is
+    /// padding that the compositor may leave at zero.
+    #[test]
+    fn converts_bgrx_frames_to_rgba() {
+        let width = 2u32;
+        let height = 2u32;
+        let stride = width as usize * 4;
+        let mut source = Vec::new();
+        // Two rows of two pixels, padding byte zero on every one.
+        source.extend_from_slice(&[10, 20, 30, 0]);
+        source.extend_from_slice(&[40, 50, 60, 0]);
+        source.extend_from_slice(&[70, 80, 90, 0]);
+        source.extend_from_slice(&[11, 22, 33, 0]);
+
+        let rgba = convert_frame(&source, width, height, stride, 4, VideoFormat::BGRx)
+            .expect("conversion");
+
+        assert_eq!(rgba.len(), 16);
+        assert_eq!(&rgba[0..4], &[30, 20, 10, 0xFF], "first pixel");
+        assert_eq!(&rgba[4..8], &[60, 50, 40, 0xFF], "second pixel");
+        assert_eq!(&rgba[8..12], &[90, 80, 70, 0xFF], "third pixel");
+        assert_eq!(&rgba[12..16], &[33, 22, 11, 0xFF], "fourth pixel");
+    }
+
+    /// An RGBx frame is already in red-first order, so only alpha changes.
+    #[test]
+    fn converts_rgbx_frames_to_rgba() {
+        let source = vec![1u8, 2, 3, 0, 4, 5, 6, 0];
+        let rgba =
+            convert_frame(&source, 2, 1, 8, 4, VideoFormat::RGBx).expect("conversion");
+        assert_eq!(&rgba[0..4], &[1, 2, 3, 0xFF]);
+        assert_eq!(&rgba[4..8], &[4, 5, 6, 0xFF]);
+    }
+
+    /// RGB and BGR are three bytes per pixel.
+    #[test]
+    fn converts_three_byte_frames() {
+        let source = vec![1u8, 2, 3, 4, 5, 6];
+        let rgba = convert_frame(&source, 2, 1, 6, 3, VideoFormat::RGB).expect("conversion");
+        assert_eq!(&rgba[0..4], &[1, 2, 3, 0xFF]);
+        assert_eq!(&rgba[4..8], &[4, 5, 6, 0xFF]);
+    }
+
+    /// A buffer too short for the geometry must be rejected, not read past.
+    #[test]
+    fn rejects_a_buffer_that_is_too_short() {
+        let source = vec![0u8; 16];
+        assert!(convert_frame(&source, 4, 4, 16, 4, VideoFormat::BGRx).is_none());
+    }
 
     /// A second lock on the same mutex would wedge the PipeWire mainloop
     /// thread forever. The work runs on a helper thread with a deadline so
