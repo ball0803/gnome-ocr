@@ -96,6 +96,20 @@ ${XDG_STATE_HOME:-~/.local/state}/gnome-ocr/gnome-ocr.log
 
 Set `RUST_LOG` to change verbosity, e.g. `RUST_LOG=debug ./target/release/gnome-ocr`.
 
+## Captured frames
+
+Every frame handed to OCR is also written out as a PNG, so you can see
+exactly what the recogniser was given:
+
+```
+${XDG_STATE_HOME:-~/.local/state}/gnome-ocr/frames/frame-0001.png
+```
+
+The first three frames are always saved. Set `GNOME_OCR_DUMP_ALL=1` to keep
+every frame, and `GNOME_OCR_DUMP_DIR=/some/path` to write them elsewhere.
+The file is a copy of the exact PNG that qocrd read, so it cannot differ
+from what was recognised.
+
 ## Design
 
 ```

@@ -6,6 +6,7 @@
 
 mod capture;
 mod engine;
+mod paths;
 mod pipeline;
 mod ui;
 
@@ -93,10 +94,5 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for Tee {
 }
 
 fn log_file() -> Option<PathBuf> {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
-        })
-        .map(|base| base.join("gnome-ocr/gnome-ocr.log"))
+    Some(paths::state_dir().join("gnome-ocr.log"))
 }

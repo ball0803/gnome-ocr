@@ -88,6 +88,10 @@ pub struct Engine {
     process: Process,
     japanese_only: bool,
     scratch: PathBuf,
+    dump_dir: Option<PathBuf>,
+    dump_every: bool,
+    frames: u64,
+    dumped: u32,
 }
 
 impl Engine {
@@ -96,6 +100,10 @@ impl Engine {
             process: Process::spawn()?,
             japanese_only,
             scratch: scratch_path(),
+            dump_dir: dump_dir(),
+            dump_every: std::env::var_os("GNOME_OCR_DUMP_ALL").is_some(),
+            frames: 0,
+            dumped: 0,
         })
     }
 
@@ -104,8 +112,12 @@ impl Engine {
     /// A protocol failure replaces the qocrd child so the next scan starts
     /// from a clean daemon, then reports the error to the caller.
     pub fn scan(&mut self, rgba: &[u8], width: u32, height: u32) -> Result<ScanResult> {
+        self.frames += 1;
         let outcome = match write_png(&self.scratch, rgba, width, height) {
-            Ok(()) => self.exchange(),
+            Ok(()) => {
+                self.report_frame(width, height);
+                self.exchange()
+            }
             Err(err) => Err(err),
         };
 
@@ -220,6 +232,36 @@ fn which(binary: &str) -> Option<PathBuf> {
             .find(|candidate| candidate.is_file())
     })
 }
+/// Where captured frames are written for inspection.
+fn dump_dir() -> Option<PathBuf> {
+    let dir = match std::env::var_os("GNOME_OCR_DUMP_DIR") {
+        Some(path) => PathBuf::from(path),
+        None => crate::paths::state_dir().join("frames"),
+    };
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+impl Engine {
+    fn report_frame(&mut self, width: u32, height: u32) {
+        let n = self.frames;
+        if n <= 3 || n.is_multiple_of(30) {
+            tracing::info!("frame {n} captured: {width}x{height}");
+        }
+
+        let Some(dir) = self.dump_dir.clone() else { return };
+        if !self.dump_every && self.dumped >= 3 {
+            return;
+        }
+        self.dumped += 1;
+        let target = dir.join(format!("frame-{n:04}.png"));
+        match std::fs::copy(&self.scratch, &target) {
+            Ok(_) => tracing::info!("frame {n} written to {}", target.display()),
+            Err(err) => tracing::warn!("could not write frame {n}: {err}"),
+        }
+    }
+}
+
 fn mean_luma(rgba: &[u8]) -> f32 {
     let mut total = 0u64;
     for [r, g, b, _] in rgba.as_chunks::<4>().0 {
