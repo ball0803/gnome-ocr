@@ -5,7 +5,7 @@
 //! crop rectangle with corner and edge handles, so any rectangle can be
 //! selected and adjusted, and only that part of the frame is recognised.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -53,6 +53,9 @@ struct Preview {
     surface: RefCell<Option<cairo::ImageSurface>>,
     crop: RefCell<Option<Region>>,
     drag: RefCell<Option<Drag>>,
+    /// Where the frame was last drawn, so pointer positions can be turned
+    /// into a position in the frame.
+    rect: Cell<Option<(f64, f64, f64, f64)>>,
 }
 
 impl Preview {
@@ -61,25 +64,51 @@ impl Preview {
             surface: RefCell::new(None),
             crop: RefCell::new(None),
             drag: RefCell::new(None),
+            rect: Cell::new(None),
         }
     }
 
-    /// The size of the captured frame in pixels.
-    fn size(&self) -> (f64, f64) {
-        match self.surface.borrow().as_ref() {
-            Some(surface) => (surface.width() as f64, surface.height() as f64),
-            None => (0.0, 0.0),
+    /// The rectangle the frame is drawn in, scaled to fit the space
+    /// available while keeping its proportions.
+    fn fitted_rect(&self, width: f64, height: f64) -> Option<(f64, f64, f64, f64)> {
+        let surface = self.surface.borrow();
+        let surface = surface.as_ref()?;
+        let image_width = surface.width() as f64;
+        let image_height = surface.height() as f64;
+        if image_width <= 0.0 || image_height <= 0.0 {
+            return None;
         }
+        let scale = (width / image_width).min(height / image_height);
+        let drawn_width = image_width * scale;
+        let drawn_height = image_height * scale;
+        Some((
+            (width - drawn_width) / 2.0,
+            (height - drawn_height) / 2.0,
+            drawn_width,
+            drawn_height,
+        ))
     }
 
-    /// The crop rectangle in pixels.
-    fn crop_pixels(&self) -> Option<(f64, f64, f64, f64)> {
+    /// A pointer position, as a fraction of the frame.
+    fn to_fraction(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let (left, top, width, height) = self.rect.get()?;
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        Some((
+            ((x - left) / width).clamp(0.0, 1.0),
+            ((y - top) / height).clamp(0.0, 1.0),
+        ))
+    }
+
+    /// The crop rectangle, where it is drawn.
+    fn crop_rect(&self) -> Option<(f64, f64, f64, f64)> {
         let crop = *self.crop.borrow();
         let crop = crop?;
-        let (width, height) = self.size();
+        let (left, top, width, height) = self.rect.get()?;
         Some((
-            crop.x * width,
-            crop.y * height,
+            left + crop.x * width,
+            top + crop.y * height,
             crop.width * width,
             crop.height * height,
         ))
@@ -87,7 +116,7 @@ impl Preview {
 
     /// The handle under the pointer, if any.
     fn handle_at(&self, x: f64, y: f64) -> Option<Handle> {
-        let (left, top, width, height) = self.crop_pixels()?;
+        let (left, top, width, height) = self.crop_rect()?;
         let right = left + width;
         let bottom = top + height;
         let middle_x = (left + right) / 2.0;
@@ -113,7 +142,7 @@ impl Preview {
 
     /// True when the point is inside the crop rectangle.
     fn inside_crop(&self, x: f64, y: f64) -> bool {
-        let Some((left, top, width, height)) = self.crop_pixels() else {
+        let Some((left, top, width, height)) = self.crop_rect() else {
             return false;
         };
         x >= left && x <= left + width && y >= top && y <= top + height
@@ -254,22 +283,21 @@ impl Window {
         info_row.append(&area_label);
         info_row.append(&reset_button);
 
-        let canvas = gtk::DrawingArea::builder().hexpand(true).vexpand(true).build();
+        let canvas = gtk::DrawingArea::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .content_height(280)
+            .build();
         canvas.add_css_class("card");
         canvas.set_tooltip_text(Some(
             "Drag to draw a crop, drag a handle to resize it, drag inside it to move it.",
         ));
 
-        let preview_scroller = gtk::ScrolledWindow::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .child(&canvas)
-            .hscrollbar_policy(gtk::PolicyType::Automatic)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_bottom(8)
-            .build();
+        let preview_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        preview_pane.set_margin_start(12);
+        preview_pane.set_margin_end(12);
+        preview_pane.set_margin_bottom(8);
+        preview_pane.append(&canvas);
 
         let status = gtk::Label::new(Some("Idle — press Start OCR to begin."));
         status.set_xalign(0.0);
@@ -304,7 +332,7 @@ impl Window {
         let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
         layout.append(&toolbar);
         layout.append(&info_row);
-        layout.append(&preview_scroller);
+        layout.append(&preview_pane);
         layout.append(&status);
         layout.append(&scroller);
         root.set_child(Some(&layout));
@@ -355,24 +383,39 @@ impl Window {
     /// Paints the captured frame at its own size, with the crop on top.
     fn draw_preview(self: &Rc<Self>) {
         let preview = Rc::clone(&self.preview);
-        self.canvas.set_draw_func(move |_area, context, _width, _height| {
+        self.canvas.set_draw_func(move |_area, context, width, height| {
+            let width = width as f64;
+            let height = height as f64;
+            let Some((left, top, drawn_width, drawn_height)) =
+                preview.fitted_rect(width, height)
+            else {
+                return;
+            };
+            preview.rect.set(Some((left, top, drawn_width, drawn_height)));
+
             let surface = preview.surface.borrow();
             let Some(surface) = surface.as_ref() else {
                 return;
             };
             let _ = context.save();
+            context.translate(left, top);
+            context.scale(
+                drawn_width / surface.width() as f64,
+                drawn_height / surface.height() as f64,
+            );
             let _ = context.set_source_surface(surface, 0.0, 0.0);
             let _ = context.paint();
             let _ = context.restore();
 
-            let Some((left, top, width, height)) = preview.crop_pixels() else {
+            let Some((left, top, width, height)) = preview.crop_rect() else {
                 return;
             };
 
             // Dim everything outside the crop.
             context.set_source_rgba(0.0, 0.0, 0.0, 0.55);
-            let (frame_width, frame_height) = preview.size();
-            context.rectangle(0.0, 0.0, frame_width, frame_height);
+            let (frame_left, frame_top, frame_width, frame_height) =
+                preview.rect.get().unwrap_or((0.0, 0.0, 0.0, 0.0));
+            context.rectangle(frame_left, frame_top, frame_width, frame_height);
             let _ = context.fill_preserve();
             context.set_source_rgba(0.0, 0.0, 0.0, 0.0);
             context.rectangle(left, top, width, height);
@@ -416,50 +459,44 @@ impl Window {
 
         let begin = Rc::clone(&self.preview);
         drag.connect_drag_begin(move |_gesture, x, y| {
-            let (width, height) = begin.size();
-            if width <= 0.0 || height <= 0.0 {
+            let Some(fraction) = begin.to_fraction(x, y) else {
                 return;
-            }
+            };
             if let Some(handle) = begin.handle_at(x, y) {
                 let start = begin.crop.borrow().unwrap_or_default();
                 *begin.drag.borrow_mut() = Some(Drag::Resize { handle, start });
             } else if begin.inside_crop(x, y) {
                 let start = begin.crop.borrow().unwrap_or_default();
                 *begin.drag.borrow_mut() = Some(Drag::Move {
-                    grab: (x, y),
+                    grab: fraction,
                     start,
                 });
             } else {
-                *begin.drag.borrow_mut() = Some(Drag::New {
-                    anchor: (x / width, y / height),
-                });
+                *begin.drag.borrow_mut() = Some(Drag::New { anchor: fraction });
                 *begin.crop.borrow_mut() = None;
             }
         });
 
         let update = Rc::clone(&self.preview);
         drag.connect_drag_update(move |_gesture, x, y| {
-            let (width, height) = update.size();
-            if width <= 0.0 || height <= 0.0 {
+            let Some(fraction) = update.to_fraction(x, y) else {
                 return;
-            }
+            };
             let current = update.drag.borrow().clone();
             match current {
                 Some(Drag::New { anchor }) => {
-                    let region = Region::from_corners(anchor, (x / width, y / height));
+                    let region = Region::from_corners(anchor, fraction);
                     *update.crop.borrow_mut() = Some(region);
                 }
                 Some(Drag::Move { grab, start }) => {
-                    let dx = (x - grab.0) / width;
-                    let dy = (y - grab.1) / height;
                     let mut region = start;
-                    region.x = (region.x + dx).clamp(0.0, 1.0 - region.width);
-                    region.y = (region.y + dy).clamp(0.0, 1.0 - region.height);
+                    region.x = (region.x + fraction.0 - grab.0).clamp(0.0, 1.0 - region.width);
+                    region.y = (region.y + fraction.1 - grab.1).clamp(0.0, 1.0 - region.height);
                     *update.crop.borrow_mut() = Some(region);
                 }
                 Some(Drag::Resize { handle, start }) => {
                     let mut region = start;
-                    resize(&mut region, handle, x / width, y / height);
+                    resize(&mut region, handle, fraction.0, fraction.1);
                     *update.crop.borrow_mut() = Some(region);
                 }
                 None => {}
@@ -618,11 +655,7 @@ impl Window {
             }
             Event::Preview(png) => {
                 if let Ok(surface) = cairo::ImageSurface::create_from_png(&mut &png[..]) {
-                    let width = surface.width();
-                    let height = surface.height();
                     *self.preview.surface.borrow_mut() = Some(surface);
-                    self.canvas.set_content_width(width);
-                    self.canvas.set_content_height(height);
                     self.canvas.queue_draw();
                 }
             }

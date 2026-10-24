@@ -63,8 +63,8 @@ a new capture.
 portal asks again which screen or window to use, instead of restoring the
 previous choice.
 
-The preview shows what is being captured, at the size it was captured, along
-with the kind of source and its size. It carries a crop rectangle:
+The preview shows what is being captured, scaled to fit the pane, along with
+the kind of source and its size. It carries a crop rectangle:
 
 - drag on the preview to draw one
 - drag a handle, corner or edge, to resize it
