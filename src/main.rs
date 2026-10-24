@@ -12,6 +12,7 @@ mod paths;
 mod pipeline;
 mod preview;
 mod region;
+mod settings;
 mod ui;
 
 use std::io::Write;

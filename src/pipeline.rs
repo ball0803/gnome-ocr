@@ -79,7 +79,7 @@ impl Pipeline {
         japanese_only: bool,
         restore_token: Arc<Mutex<Option<String>>>,
         region: Arc<Mutex<Option<crate::region::Region>>>,
-        settings: Arc<Mutex<crate::dedupe::Settings>>,
+        settings: crate::settings::Shared,
     ) -> Self {
         let (commands, inbox) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -142,7 +142,7 @@ fn run(
     japanese_only: bool,
     restore_token: Arc<Mutex<Option<String>>>,
     region: Arc<Mutex<Option<crate::region::Region>>>,
-    settings: Arc<Mutex<crate::dedupe::Settings>>,
+    settings: crate::settings::Shared,
 ) {
     guarded(&events, || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -290,7 +290,8 @@ fn run(
                 Ok(scan) => {
                     // The order and the structure of the text are worked out
                     // from where each line was found.
-                    let layout = crate::layout::analyse(&scan.lines);
+                    let current = crate::settings::read(&settings);
+                    let layout = crate::layout::analyse(&scan.lines, current.clump);
                     let mut fresh = Vec::new();
                     for block in &layout.blocks {
                         let detection = crate::dedupe::Detection {
@@ -317,7 +318,7 @@ fn run(
                                 &scanned.rgba,
                                 scanned.width,
                                 scanned.height,
-                                480,
+                                320,
                             )
                         })
                     };

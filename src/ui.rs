@@ -16,7 +16,7 @@ use gtk::gdk::prelude::*;
 use gtk::prelude::*;
 use gtk::{cairo, gio, glib};
 
-use crate::dedupe::Settings;
+use crate::settings;
 use crate::pipeline::{Event, Pipeline};
 use crate::region::Region;
 
@@ -25,9 +25,9 @@ const APP_ID: &str = "dev.local.gnome_ocr";
 /// How many entries the list keeps before the oldest are dropped.
 const MAX_LIST_ENTRIES: usize = 200;
 
-/// The width the pictures in the list are shown at. They are shown at the
-/// size they were made, rather than being scaled to fit a box of their own.
-const MAX_IMAGE_WIDTH: i32 = 480;
+/// The width the pictures in the list are made and shown at. They are shown
+/// at the size they were made, rather than being scaled to fit a box.
+const MAX_IMAGE_WIDTH: i32 = 320;
 
 /// How close the pointer has to be to a handle to grab it.
 const HANDLE_GRAB: f64 = 10.0;
@@ -367,7 +367,7 @@ struct Window {
     list: gtk::ListBox,
     settings_button: gtk::Button,
     popover: gtk::Popover,
-    settings: Arc<Mutex<Settings>>,
+    settings: settings::Shared,
     copy_button: gtk::Button,
     clear_button: gtk::Button,
     auto_copy: gtk::Switch,
@@ -562,7 +562,7 @@ impl Window {
         layout.append(&status);
         root.set_child(Some(&layout));
 
-        let settings = Arc::new(Mutex::new(Settings::default()));
+        let settings = settings::shared();
         let popover = gtk::Popover::new();
         popover.set_parent(&settings_button);
         popover.set_child(Some(&settings_panel(settings.clone())));
@@ -1115,7 +1115,7 @@ impl Window {
 }
 
 /// The settings popover, with a control for each threshold.
-fn settings_panel(settings: Arc<Mutex<Settings>>) -> gtk::Box {
+fn settings_panel(settings: settings::Shared) -> gtk::Box {
     let panel = gtk::Box::new(gtk::Orientation::Vertical, 8);
     panel.set_margin_top(12);
     panel.set_margin_bottom(12);
@@ -1142,6 +1142,14 @@ fn settings_panel(settings: Arc<Mutex<Settings>>) -> gtk::Box {
         "How alike two boxes have to be in size to count as the same place.",
     ));
 
+    let clump = gtk::CheckButton::with_label("Join lines into paragraphs");
+    clump.set_active(current.clump);
+    clump.set_tooltip_text(Some(
+        "When on, the lines that belong to the same paragraph are shown as one \
+         line. When off, each line keeps its own line.",
+    ));
+    panel.append(&clump);
+
     let for_overlap = settings.clone();
     overlap.connect_value_changed(move |spin| {
         if let Ok(mut settings) = for_overlap.lock() {
@@ -1153,6 +1161,13 @@ fn settings_panel(settings: Arc<Mutex<Settings>>) -> gtk::Box {
     dimension.connect_value_changed(move |spin| {
         if let Ok(mut settings) = for_dimension.lock() {
             settings.dimension = spin.value();
+        }
+    });
+
+    let for_clump = settings.clone();
+    clump.connect_toggled(move |button| {
+        if let Ok(mut settings) = for_clump.lock() {
+            settings.clump = button.is_active();
         }
     });
 

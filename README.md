@@ -98,7 +98,9 @@ memory only, so nothing is left behind on disk. They are shown at the size
 they were made, rather than being scaled to fit.
 
 **Settings** opens a panel with the two thresholds that decide whether two
-detections are in the same place, so they can be tuned while the app runs.
+detections are in the same place, and a choice of whether the lines that
+belong to the same paragraph are joined into one line or each keeps its own.
+They can all be tuned while the app runs.
 
 ## The order of the text
 

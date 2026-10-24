@@ -7,28 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// The thresholds that decide whether two detections are in the same place.
-///
-/// They can be changed while the app runs.
-#[derive(Debug, Clone, Copy)]
-pub struct Settings {
-    /// How much two boxes have to overlap to count as the same place.
-    ///
-    /// This is the usual threshold for "the same object" in detection work.
-    pub overlap: f64,
-    /// How alike two boxes have to be in size to count as the same place
-    /// even when they do not overlap.
-    pub dimension: f64,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            overlap: 0.5,
-            dimension: 0.9,
-        }
-    }
-}
+use crate::settings::Settings;
 
 /// An axis-aligned rectangle in the pixels of the captured frame.
 #[derive(Debug, Clone, Copy, PartialEq)]

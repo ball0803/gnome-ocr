@@ -193,7 +193,10 @@ struct Item {
 }
 
 /// Works out the order and the structure of the recognised lines.
-pub fn analyse(lines: &[Line]) -> Layout {
+///
+/// When `clump` is set, the lines of a paragraph are joined into one line.
+/// Otherwise each keeps its own line.
+pub fn analyse(lines: &[Line], clump: bool) -> Layout {
     let text_lines: Vec<&Line> = lines.iter().filter(|line| line.is_text).collect();
     if text_lines.is_empty() {
         return Layout::default();
@@ -209,7 +212,7 @@ pub fn analyse(lines: &[Line]) -> Layout {
     let (vertical, horizontal): (Vec<&Line>, Vec<&Line>) =
         text_lines.iter().partition(|line| line.is_vertical);
 
-    let mut blocks = order_horizontal(&horizontal, median_height);
+    let mut blocks = order_horizontal(&horizontal, median_height, clump);
 
     // Vertical runs are read from the right, and come after the horizontal
     // ones.
@@ -252,7 +255,7 @@ fn body_height(heights: &[f64]) -> f64 {
 }
 
 /// Orders the lines that run across, and works out the headings.
-fn order_horizontal(lines: &[&Line], median_height: f64) -> Vec<Block> {
+fn order_horizontal(lines: &[&Line], median_height: f64, clump: bool) -> Vec<Block> {
     if lines.is_empty() {
         return Vec::new();
     }
@@ -273,7 +276,7 @@ fn order_horizontal(lines: &[&Line], median_height: f64) -> Vec<Block> {
         }
     }
 
-    let paragraphs = group_paragraphs(&body, median_height);
+    let paragraphs = group_paragraphs(&body, median_height, clump);
     let mut items: Vec<Item> = paragraphs
         .into_iter()
         .map(|paragraph| Item {
@@ -390,7 +393,7 @@ struct Paragraph {
 }
 
 /// Groups the lines into paragraphs.
-fn group_paragraphs(lines: &[&Line], median_height: f64) -> Vec<Paragraph> {
+fn group_paragraphs(lines: &[&Line], median_height: f64, clump: bool) -> Vec<Paragraph> {
     let mut paragraphs: Vec<Paragraph> = Vec::new();
     let mut current: Vec<&Line> = Vec::new();
     let mut current_left: Option<f64> = None;
@@ -410,7 +413,7 @@ fn group_paragraphs(lines: &[&Line], median_height: f64) -> Vec<Paragraph> {
             current.push(line);
         } else {
             if !current.is_empty() {
-                paragraphs.push(make_paragraph(&current));
+                paragraphs.push(make_paragraph(&current, clump));
             }
             current = vec![line];
             current_left = Some(line.bounds.x);
@@ -419,17 +422,17 @@ fn group_paragraphs(lines: &[&Line], median_height: f64) -> Vec<Paragraph> {
     }
 
     if !current.is_empty() {
-        paragraphs.push(make_paragraph(&current));
+        paragraphs.push(make_paragraph(&current, clump));
     }
     paragraphs
 }
 
 /// Joins a group of lines into one paragraph.
-fn make_paragraph(lines: &[&Line]) -> Paragraph {
+fn make_paragraph(lines: &[&Line], clump: bool) -> Paragraph {
     let mut text = String::new();
     for line in lines {
         if !text.is_empty() {
-            text.push('\n');
+            text.push(if clump { ' ' } else { '\n' });
         }
         text.push_str(&line_text(line));
     }
@@ -633,8 +636,19 @@ mod tests {
             line("second", 100.0, 130.0, 200.0, 20.0),
             line("third", 100.0, 160.0, 200.0, 20.0),
         ];
-        let layout = analyse(&lines);
-        assert_eq!(texts(&layout.blocks), vec!["first\nsecond\nthird"]);
+        let layout = analyse(&lines, true);
+        assert_eq!(texts(&layout.blocks), vec!["first second third"]);
+    }
+
+    /// With the joining turned off, each line keeps its own line.
+    #[test]
+    fn the_lines_of_a_paragraph_can_be_kept_apart() {
+        let lines = vec![
+            line("first", 100.0, 100.0, 200.0, 20.0),
+            line("second", 100.0, 130.0, 200.0, 20.0),
+        ];
+        let layout = analyse(&lines, false);
+        assert_eq!(texts(&layout.blocks), vec!["first\nsecond"]);
     }
 
     #[test]
@@ -643,7 +657,7 @@ mod tests {
             line("first", 100.0, 100.0, 200.0, 20.0),
             line("second", 100.0, 400.0, 200.0, 20.0),
         ];
-        let layout = analyse(&lines);
+        let layout = analyse(&lines, true);
         assert_eq!(texts(&layout.blocks), vec!["first", "second"]);
     }
 
@@ -655,10 +669,10 @@ mod tests {
             line("right one", 700.0, 100.0, 150.0, 20.0),
             line("right two", 700.0, 130.0, 150.0, 20.0),
         ];
-        let layout = analyse(&lines);
+        let layout = analyse(&lines, true);
         assert_eq!(
             texts(&layout.blocks),
-            vec!["left one\nleft two", "right one\nright two"]
+            vec!["left one left two", "right one right two"]
         );
     }
 
@@ -669,7 +683,7 @@ mod tests {
             line("two", 100.0, 128.0, 200.0, 20.0),
             line("three", 100.0, 300.0, 200.0, 20.0),
         ];
-        let layout = analyse(&lines);
+        let layout = analyse(&lines, true);
         assert_eq!(texts(&layout.blocks).len(), 2);
         assert!(layout.blocks[0].text().contains("one"));
         assert!(layout.blocks[1].text().contains("three"));
@@ -681,7 +695,7 @@ mod tests {
             line("A Heading", 100.0, 100.0, 400.0, 50.0),
             line("body text", 100.0, 170.0, 200.0, 20.0),
         ];
-        let layout = analyse(&lines);
+        let layout = analyse(&lines, true);
         assert!(matches!(layout.blocks[0], Block::Heading { level: 1, .. }));
         let sections = layout.sections();
         assert_eq!(sections.len(), 1);
@@ -696,7 +710,7 @@ mod tests {
         let mut right = line("right column", 500.0, 100.0, 30.0, 200.0);
         right.is_vertical = true;
 
-        let layout = analyse(&[left, right]);
+        let layout = analyse(&[left, right], true);
         assert_eq!(texts(&layout.blocks), vec!["right column", "left column"]);
     }
 
@@ -710,7 +724,7 @@ mod tests {
         let mut text_line = line("", 10.0, 10.0, 110.0, 20.0);
         text_line.words = vec![first, second];
 
-        let layout = analyse(&[text_line]);
+        let layout = analyse(&[text_line], true);
         assert_eq!(layout.blocks[0].text(), "Hello World");
     }
 
@@ -720,13 +734,13 @@ mod tests {
         rule.is_text = false;
         let lines = vec![rule, line("real text", 10.0, 40.0, 200.0, 20.0)];
 
-        let layout = analyse(&lines);
+        let layout = analyse(&lines, true);
         assert_eq!(texts(&layout.blocks), vec!["real text"]);
     }
 
     #[test]
     fn nothing_gives_an_empty_layout() {
-        let layout = analyse(&[]);
+        let layout = analyse(&[], true);
         assert!(layout.blocks.is_empty());
         assert!(layout.blocks.is_empty());
     }
