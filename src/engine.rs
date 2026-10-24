@@ -42,6 +42,8 @@ struct ScanLine {
     #[serde(default)]
     content_type: String,
     #[serde(default)]
+    block_id: i64,
+    #[serde(default)]
     direction: String,
     #[serde(default)]
     confidence: f64,
@@ -385,6 +387,7 @@ impl Engine {
                 is_vertical: line.is_vertical || line.direction == "TOP_TO_BOTTOM",
                 is_right_to_left: line.direction == "RIGHT_TO_LEFT",
                 is_text: is_text_content(&line.content_type) && line.confidence >= MIN_CONFIDENCE,
+                block_id: line.block_id,
             });
         }
 
@@ -403,6 +406,7 @@ impl Engine {
                     is_vertical: false,
                     is_right_to_left: false,
                     is_text: true,
+                    block_id: 0,
                 });
             }
         }

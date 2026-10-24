@@ -75,6 +75,9 @@ pub struct Line {
     pub is_right_to_left: bool,
     /// Whether the line is text at all, as opposed to a rule or a picture.
     pub is_text: bool,
+    /// The block the engine's layout model put this line in. The lines of
+    /// one block belong to the same paragraph.
+    pub block_id: i64,
 }
 
 /// A piece of the text, in reading order.
@@ -393,7 +396,48 @@ struct Paragraph {
 }
 
 /// Groups the lines into paragraphs.
+///
+/// The engine's layout model already says which lines belong together, and it
+/// knows things that cannot be told from the geometry alone, such as a
+/// paragraph whose first line is indented. It is used when it has grouped
+/// anything at all; otherwise the lines are grouped by their left edge and
+/// the gap between them.
 fn group_paragraphs(lines: &[&Line], median_height: f64, clump: bool) -> Vec<Paragraph> {
+    // The engine numbers the blocks it found, starting at zero. If every
+    // line is in block zero then it has not grouped anything, and the
+    // geometry is all there is to go on.
+    let grouped = lines.iter().any(|line| line.block_id != 0);
+    if grouped {
+        return group_by_block(lines, clump);
+    }
+
+    group_by_geometry(lines, median_height, clump)
+}
+
+/// Groups the lines by the block the engine put them in.
+fn group_by_block(lines: &[&Line], clump: bool) -> Vec<Paragraph> {
+    let mut order: Vec<i64> = Vec::new();
+    for line in lines {
+        if !order.contains(&line.block_id) {
+            order.push(line.block_id);
+        }
+    }
+
+    order
+        .into_iter()
+        .map(|block| {
+            let group: Vec<&Line> = lines
+                .iter()
+                .copied()
+                .filter(|line| line.block_id == block)
+                .collect();
+            make_paragraph(&group, clump)
+        })
+        .collect()
+}
+
+/// Groups the lines by their left edge and the gap between them.
+fn group_by_geometry(lines: &[&Line], median_height: f64, clump: bool) -> Vec<Paragraph> {
     let mut paragraphs: Vec<Paragraph> = Vec::new();
     let mut current: Vec<&Line> = Vec::new();
     let mut current_left: Option<f64> = None;
@@ -622,6 +666,7 @@ mod tests {
             is_vertical: false,
             is_right_to_left: false,
             is_text: true,
+            block_id: 0,
         }
     }
 
@@ -638,6 +683,58 @@ mod tests {
         ];
         let layout = analyse(&lines, true);
         assert_eq!(texts(&layout.blocks), vec!["first second third"]);
+    }
+
+    /// The engine's layout model says which lines belong together, and it
+    /// knows things the geometry alone does not, such as a paragraph whose
+    /// first line is indented.
+    #[test]
+    fn the_lines_of_one_block_are_one_paragraph() {
+        let mut first = line("A paragraph that starts", 96.0, 100.0, 300.0, 20.0);
+        first.block_id = 1;
+        let mut second = line("with an indented first line", 60.0, 130.0, 300.0, 20.0);
+        second.block_id = 1;
+        let mut third = line("and a third line", 60.0, 160.0, 300.0, 20.0);
+        third.block_id = 1;
+
+        let layout = analyse(&[first, second, third], true);
+        assert_eq!(texts(&layout.blocks), vec!["A paragraph that starts with an indented first line and a third line"]);
+    }
+
+    /// Lines the engine put in different blocks are different paragraphs.
+    #[test]
+    fn lines_of_different_blocks_are_different_paragraphs() {
+        let mut first = line("one", 60.0, 100.0, 200.0, 20.0);
+        first.block_id = 1;
+        let mut second = line("two", 60.0, 300.0, 200.0, 20.0);
+        second.block_id = 2;
+
+        let layout = analyse(&[first, second], true);
+        assert_eq!(texts(&layout.blocks), vec!["one", "two"]);
+    }
+
+    /// A screen is mostly separate labels, with the occasional sentence
+    /// wrapped over two lines. The engine tells the two apart.
+    #[test]
+    fn a_wrapped_sentence_is_joined_among_separate_labels() {
+        let mut heading = line("Heading", 60.0, 60.0, 200.0, 24.0);
+        heading.block_id = 0;
+        let mut first = line("The sentence that was", 60.0, 120.0, 300.0, 20.0);
+        first.block_id = 1;
+        let mut second = line("wrapped over two lines", 60.0, 145.0, 300.0, 20.0);
+        second.block_id = 1;
+        let mut other = line("A separate label", 60.0, 200.0, 200.0, 20.0);
+        other.block_id = 2;
+
+        let layout = analyse(&[heading, first, second, other], true);
+        assert_eq!(
+            texts(&layout.blocks),
+            vec![
+                "Heading",
+                "The sentence that was wrapped over two lines",
+                "A separate label"
+            ]
+        );
     }
 
     /// With the joining turned off, each line keeps its own line.

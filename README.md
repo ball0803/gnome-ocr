@@ -108,8 +108,10 @@ The recogniser reports where each line was found, but not the order they
 should be read in. That is worked out from the geometry, in the way the
 document analysis literature does it:
 
-- lines are grouped into paragraphs, by their left edge and the gap between
-  them
+- lines are grouped into paragraphs using the block the engine's layout
+  model put them in, which knows things the geometry alone does not, such
+  as a paragraph whose first line is indented. When the engine has grouped
+  nothing, the left edge and the gap between the lines are used instead
 - the paragraphs are then cut up recursively at the widest run of
   whitespace, which recovers the reading order and the structure at once: a
   cut between columns is a level of the structure, and so is a cut between
