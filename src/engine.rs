@@ -6,7 +6,8 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
 use anyhow::{Context, Result};
@@ -42,6 +43,9 @@ pub struct ScanResult {
 
 /// How long to wait for qocrd to answer a scan.
 const SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How often the wait checks whether the scan should be abandoned.
+const SCAN_POLL: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// The qocrd child process. Owns its own teardown so it can be swapped out.
 struct Process {
@@ -107,6 +111,7 @@ impl Drop for Process {
 /// OCR engine backed by a long-lived qocrd process.
 pub struct Engine {
     process: Process,
+    cancel: Arc<AtomicBool>,
     japanese_only: bool,
     scratch: PathBuf,
     dump_dir: Option<PathBuf>,
@@ -116,9 +121,14 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn spawn(japanese_only: bool) -> Result<Self> {
+    /// Starts the engine.
+    ///
+    /// `cancel` is shared with the pipeline so that stopping abandons a scan
+    /// that is already in flight instead of waiting for it to finish.
+    pub fn spawn(japanese_only: bool, cancel: Arc<AtomicBool>) -> Result<Self> {
         Ok(Self {
             process: Process::spawn()?,
+            cancel,
             japanese_only,
             scratch: scratch_path(),
             dump_dir: dump_dir(),
@@ -158,7 +168,11 @@ impl Engine {
                     mean_luma(rgba)
                 );
                 let _ = std::fs::remove_file(&self.scratch);
-                self.process = Process::spawn()?;
+                // A scan that was abandoned because the capture stopped does
+                // not need a fresh daemon; the engine is about to be dropped.
+                if !self.cancel.load(Ordering::Relaxed) {
+                    self.process = Process::spawn()?;
+                }
                 Err(err)
             }
         }
@@ -179,16 +193,27 @@ impl Engine {
         // qocrd terminates each reply with a NUL byte, so exactly one JSON
         // value is read per command. Trying to read a second lands on that
         // NUL and fails to parse.
-        let response = match self.process.responses.recv_timeout(SCAN_TIMEOUT) {
-            Ok(response) => response,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        // Wait in short steps so a stop is picked up promptly rather than
+        // after the whole scan timeout.
+        let deadline = std::time::Instant::now() + SCAN_TIMEOUT;
+        let response = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
                 return Err(anyhow::anyhow!(
                     "qocrd did not answer within {}s",
                     SCAN_TIMEOUT.as_secs()
                 ));
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(anyhow::anyhow!("qocrd closed its output"));
+            match self.process.responses.recv_timeout(remaining.min(SCAN_POLL)) {
+                Ok(response) => break response,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow::anyhow!("qocrd closed its output"));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if self.cancel.load(Ordering::Relaxed) {
+                        return Err(anyhow::anyhow!("scan abandoned because the capture stopped"));
+                    }
+                }
             }
         }
         .context("parse qocrd response")?;
@@ -351,7 +376,7 @@ mod tests {
     #[test]
     fn recognises_text_rendered_into_a_frame() {
         let (width, height, rgba) = render_text("HELLO WORLD 12345");
-        let mut engine = Engine::spawn(false).expect("spawn qocrd");
+        let mut engine = Engine::spawn(false, Arc::new(AtomicBool::new(false))).expect("spawn qocrd");
         let result = engine.scan(&rgba, width, height).expect("scan should succeed");
 
         assert!(!result.lines.is_empty(), "qocrd returned no text");
@@ -367,14 +392,14 @@ mod tests {
     #[test]
     fn returns_no_text_for_a_blank_frame_instead_of_erroring() {
         let (width, height, rgba) = render_text("");
-        let mut engine = Engine::spawn(false).expect("spawn qocrd");
+        let mut engine = Engine::spawn(false, Arc::new(AtomicBool::new(false))).expect("spawn qocrd");
         let result = engine.scan(&rgba, width, height).expect("blank frame must not error");
         assert!(result.lines.is_empty(), "expected no lines, got {:?}", result.lines);
     }
 
     #[test]
     fn rejects_a_frame_whose_size_does_not_match_its_pixels() {
-        let mut engine = Engine::spawn(false).expect("spawn qocrd");
+        let mut engine = Engine::spawn(false, Arc::new(AtomicBool::new(false))).expect("spawn qocrd");
         let too_small = vec![0u8; 16];
         assert!(engine.scan(&too_small, 100, 100).is_err());
     }

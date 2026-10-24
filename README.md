@@ -51,6 +51,10 @@ The binary lands at `target/release/gnome-ocr`.
 Press **Start OCR** and approve the capture dialog, then choose a screen or a
 window in it. Recognised text starts filling the window.
 
+The grant is remembered for as long as the app runs, so stopping and starting
+again does not ask a second time. To pick a different screen or window, quit
+the app and start it again.
+
 Toggle **Auto-copy new text** to control whether new lines are copied to your
 clipboard; **Copy all** copies everything shown; **Clear** empties the view
 and resets the de-duplication set.

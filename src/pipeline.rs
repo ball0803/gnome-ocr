@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -34,13 +34,17 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Start capturing and OCRing in the background.
-    pub fn start(events: Sender<Event>, japanese_only: bool) -> Self {
+    pub fn start(
+        events: Sender<Event>,
+        japanese_only: bool,
+        restore_token: Arc<Mutex<Option<String>>>,
+    ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
 
         std::thread::Builder::new()
             .name("gnome-ocr-pipeline".into())
-            .spawn(move || run(events, thread_shutdown, japanese_only))
+            .spawn(move || run(events, thread_shutdown, japanese_only, restore_token))
             .expect("spawn pipeline thread");
 
         Self { shutdown }
@@ -52,12 +56,32 @@ impl Pipeline {
     }
 }
 
-fn run(events: Sender<Event>, shutdown: Arc<AtomicBool>, japanese_only: bool) {
+fn run(
+    events: Sender<Event>,
+    shutdown: Arc<AtomicBool>,
+    japanese_only: bool,
+    restore_token: Arc<Mutex<Option<String>>>,
+) {
     guarded(&events, || {
-        if let Err(err) = execute(&events, &shutdown, japanese_only) {
+        if let Err(err) = execute(&events, &shutdown, japanese_only, &restore_token) {
             emit_terminal(&events, Event::Failed(format!("{err}")));
         }
     });
+}
+
+
+/// Resolves once the capture has been asked to stop.
+///
+/// Used to abandon the portal handshake, which otherwise waits for the
+/// permission dialog and would leave the UI waiting forever.
+async fn wait_for_cancel(cancel: Arc<AtomicBool>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(150));
+    loop {
+        ticker.tick().await;
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+    }
 }
 
 /// Runs the pipeline body and always reports that it has stopped.
@@ -86,6 +110,7 @@ fn execute(
     events: &Sender<Event>,
     shutdown: &Arc<AtomicBool>,
     japanese_only: bool,
+    restore_token: &Arc<Mutex<Option<String>>>,
 ) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -93,11 +118,22 @@ fn execute(
         .context("build tokio runtime for the portal handshake")?;
 
     let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(2);
-    let session = runtime
-        .block_on(capture::start(frame_tx))
-        .context("start screen capture")?;
+    let token = restore_token.lock().ok().and_then(|token| token.clone());
+    let (session, token) = runtime.block_on(async {
+        tokio::select! {
+            result = capture::start(frame_tx, token) => result.context("start screen capture"),
+            _ = wait_for_cancel(Arc::clone(shutdown)) => {
+                anyhow::bail!("capture cancelled before it started")
+            }
+        }
+    })?;
+    if let Some(token) = token
+        && let Ok(mut stored) = restore_token.lock()
+    {
+        *stored = Some(token);
+    }
 
-    let mut engine = Engine::spawn(japanese_only)?;
+    let mut engine = Engine::spawn(japanese_only, Arc::clone(shutdown))?;
     emit(events, Event::Started);
     tracing::info!("pipeline running");
 
@@ -224,6 +260,27 @@ mod tests {
         sender.join().expect("emit thread");
         let second = recv_with_deadline(&receiver);
         assert!(matches!(second, Event::Stopped));
+    }
+
+    /// The portal handshake waits for a permission dialog, so the stop has
+    /// to be able to abandon it.
+    #[test]
+    fn the_cancel_watcher_notices_a_stop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let flag = Arc::new(AtomicBool::new(false));
+        let watcher = Arc::clone(&flag);
+        runtime.block_on(async move {
+            let handle = tokio::spawn(wait_for_cancel(watcher));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            flag.store(true, Ordering::Relaxed);
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+                .await
+                .expect("the watcher must notice the stop")
+                .expect("the watcher must not panic");
+        });
     }
 
     /// Waits for an event, failing rather than hanging when none arrives.

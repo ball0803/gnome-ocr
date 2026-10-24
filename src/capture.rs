@@ -52,11 +52,20 @@ impl Drop for Session {
 
 /// Request a ScreenCast session and begin pumping frames into `tx`.
 ///
-/// The portal shows a permission dialog once per session; the user must accept
+/// The portal shows a permission dialog the first time; the user must accept
 /// it and pick which screen or window to share. Both kinds are requested, so
-/// the dialog lists screens and windows alike. Returns after the portal
-/// handshake, before any frame has arrived.
-pub async fn start(tx: SyncSender<Frame>) -> Result<Session> {
+/// the dialog lists screens and windows alike.
+///
+/// `restore_token` carries the token from an earlier session. When it is
+/// present the portal reuses the previous grant and shows no dialog, so
+/// stopping and starting again does not need a second approval that may
+/// appear behind the window.
+///
+/// Returns after the portal handshake, before any frame has arrived.
+pub async fn start(
+    tx: SyncSender<Frame>,
+    restore_token: Option<String>,
+) -> Result<(Session, Option<String>)> {
     let proxy = Screencast::new().await?;
     let session = proxy.create_session(Default::default()).await?;
     proxy
@@ -66,24 +75,27 @@ pub async fn start(tx: SyncSender<Frame>) -> Result<Session> {
                 .set_cursor_mode(CursorMode::Embedded)
                 .set_sources(SourceType::Monitor | SourceType::Window)
                 .set_multiple(false)
-                .set_persist_mode(PersistMode::DoNot),
+                .set_restore_token(restore_token.as_deref())
+                .set_persist_mode(PersistMode::Application),
         )
         .await?;
     let response = proxy
         .start(&session, None, Default::default())
         .await?
         .response()?;
+    let token = response.restore_token().map(ToOwned::to_owned);
     let stream = response
         .streams()
         .first()
         .context("portal returned no streams")?
         .to_owned();
     tracing::info!(
-        "portal v{} granted: node_id={} size={:?} position={:?}",
+        "portal v{} granted: node_id={} size={:?} position={:?} reused_grant={}",
         proxy.version(),
         stream.pipe_wire_node_id(),
         stream.size(),
-        stream.position()
+        stream.position(),
+        token.is_some()
     );
     let node_id: u32 = stream.pipe_wire_node_id();
     let fd: OwnedFd = proxy
@@ -103,7 +115,7 @@ pub async fn start(tx: SyncSender<Frame>) -> Result<Session> {
         })
         .context("spawn capture thread")?;
 
-    Ok(Session { cancel })
+    Ok((Session { cancel }, token))
 }
 
 fn run_pipewire(

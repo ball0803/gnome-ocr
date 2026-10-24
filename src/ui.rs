@@ -40,6 +40,7 @@ struct Window {
     auto_copy: gtk::Switch,
     status: gtk::Label,
     events: async_channel::Sender<Event>,
+    restore_token: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pipeline: RefCell<Option<Pipeline>>,
     japanese_only: bool,
     lines: RefCell<Vec<String>>,
@@ -127,6 +128,7 @@ impl Window {
             auto_copy,
             status,
             events,
+            restore_token: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pipeline: RefCell::new(None),
             japanese_only,
             lines: RefCell::new(Vec::new()),
@@ -134,6 +136,18 @@ impl Window {
 
         window.wire();
         window.consume(inbox);
+
+        // Closing the window has to stop the capture, otherwise the portal
+        // session is torn down with the process and the next start can be
+        // left waiting on a dialog nobody sees.
+        let closing = Rc::clone(&window);
+        window.root.connect_close_request(move |_| {
+            if let Some(pipeline) = closing.pipeline.borrow().as_ref() {
+                pipeline.stop();
+            }
+            gtk::glib::Propagation::Proceed
+        });
+
         window.root.present();
         window
     }
@@ -189,9 +203,14 @@ impl Window {
         self.start_button.set_sensitive(false);
         self.stop_button.set_sensitive(true);
 
+        self.root.present();
         self.set_status("Pick a screen or window in the dialog that opens…");
 
-        let pipeline = Pipeline::start(self.events.clone(), self.japanese_only);
+        let pipeline = Pipeline::start(
+            self.events.clone(),
+            self.japanese_only,
+            std::sync::Arc::clone(&self.restore_token),
+        );
         *self.pipeline.borrow_mut() = Some(pipeline);
     }
 
