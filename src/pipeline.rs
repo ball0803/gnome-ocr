@@ -57,6 +57,8 @@ enum Command {
     /// Release the current capture and open a new one, asking the portal for
     /// the source again instead of restoring the previous choice.
     ChangeSource,
+    /// Forget what has been seen, so the same text is treated as new again.
+    Clear,
 }
 
 /// A running capture and recognition pipeline.
@@ -114,6 +116,11 @@ impl Pipeline {
     pub fn change_source(&self) {
         let _ = self.commands.send(Command::ChangeSource);
     }
+
+    /// Forget what has been seen, so the same text is treated as new again.
+    pub fn clear_history(&self) {
+        let _ = self.commands.send(Command::Clear);
+    }
 }
 
 impl Drop for Pipeline {
@@ -146,7 +153,7 @@ fn run(
 
         let mut capture: Option<Capture> = None;
         let mut engine: Option<Engine> = None;
-        let mut history = History::new(settings);
+        let mut history = History::new(Arc::clone(&settings));
         let mut total: usize = 0;
         let mut recognising = false;
         let mut last_preview = std::time::Instant::now() - Duration::from_millis(400);
@@ -165,6 +172,10 @@ fn run(
                     }
                     recognising = false;
                     begin = true;
+                }
+                Ok(Command::Clear) => {
+                    history = History::new(Arc::clone(&settings));
+                    tracing::info!("forgetting what has been seen");
                 }
                 Ok(Command::Stop) => {
                     if recognising {

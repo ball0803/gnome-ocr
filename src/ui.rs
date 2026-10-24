@@ -26,20 +26,15 @@ const MAX_LIST_ENTRIES: usize = 200;
 
 /// How close the pointer has to be to a handle to grab it.
 const HANDLE_GRAB: f64 = 10.0;
-/// The smallest crop the user can make, in pixels.
-const MIN_CROP: f64 = 8.0;
+/// The smallest crop the user can make, as a fraction of the frame.
+const MIN_CROP: f64 = 0.005;
 
-/// The crop rectangle, in the coordinates the preview is drawn in.
+/// The crop rectangle, as a fraction of the captured frame.
 ///
-/// Keeping it in the same space as the pointer means the corner is under the
-/// mouse by construction: nothing has to be converted to draw it.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-struct Crop {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
+/// It is kept this way rather than in the pixels of the preview, because the
+/// preview is scaled to fit the pane. Were the crop kept in those pixels,
+/// resizing the window would move it.
+type Crop = crate::region::Region;
 
 impl Crop {
     fn right(&self) -> f64 {
@@ -174,21 +169,39 @@ impl Preview {
     fn crop_rect(&self) -> Option<(f64, f64, f64, f64)> {
         let crop = *self.crop.borrow();
         let crop = crop?;
-        Some((crop.x, crop.y, crop.width, crop.height))
+        let (left, top, width, height) = self.rect.get()?;
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        Some((
+            left + crop.x * width,
+            top + crop.y * height,
+            crop.width * width,
+            crop.height * height,
+        ))
     }
 
-    /// Keeps the crop inside the frame that is drawn.
+    /// Keeps the crop inside the frame.
     fn clamp(&self, crop: &mut Crop) {
-        let Some((left, top, width, height)) = self.rect.get() else {
-            return;
-        };
         // The crop is made to fit first. Otherwise the bounds below would
         // have a maximum below their minimum, and clamping to them would
         // fail outright.
-        crop.width = crop.width.min(width);
-        crop.height = crop.height.min(height);
-        crop.x = crop.x.clamp(left, left + width - crop.width);
-        crop.y = crop.y.clamp(top, top + height - crop.height);
+        crop.width = crop.width.clamp(0.0, 1.0);
+        crop.height = crop.height.clamp(0.0, 1.0);
+        crop.x = crop.x.clamp(0.0, 1.0 - crop.width);
+        crop.y = crop.y.clamp(0.0, 1.0 - crop.height);
+    }
+
+    /// A pointer position, as a fraction of the frame.
+    fn to_fraction(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let (left, top, width, height) = self.rect.get()?;
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        Some((
+            ((x - left) / width).clamp(0.0, 1.0),
+            ((y - top) / height).clamp(0.0, 1.0),
+        ))
     }
 
     /// Where a line sits in the preview.
@@ -208,18 +221,7 @@ impl Preview {
 
     /// The crop as a fraction of the frame, for the recogniser.
     fn crop_region(&self) -> Option<Region> {
-        let crop = *self.crop.borrow();
-        let crop = crop?;
-        let (left, top, width, height) = self.rect.get()?;
-        if width <= 0.0 || height <= 0.0 {
-            return None;
-        }
-        Some(Region {
-            x: (crop.x - left) / width,
-            y: (crop.y - top) / height,
-            width: crop.width / width,
-            height: crop.height / height,
-        })
+        *self.crop.borrow()
     }
 
     /// The handle under the pointer, if any.
@@ -418,12 +420,21 @@ impl Window {
         show_boxes.set_margin_start(12);
         show_boxes.set_margin_bottom(6);
 
-        let preview_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        // The preview and the controls that belong with it are on the left,
+        // the recognised text on the right.
+        let preview_pane = gtk::Box::new(gtk::Orientation::Vertical, 6);
         preview_pane.set_margin_start(12);
-        preview_pane.set_margin_end(12);
+        preview_pane.set_margin_end(6);
         preview_pane.set_margin_bottom(8);
-        preview_pane.append(&canvas);
         preview_pane.append(&show_boxes);
+        preview_pane.append(&canvas);
+
+        let preview_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        preview_buttons.append(&reset_button);
+        preview_buttons.append(&gtk::Label::new(Some(
+            "Drag on the preview to choose the part to recognise.",
+        )));
+        preview_pane.append(&preview_buttons);
 
         let status = gtk::Label::new(Some("Idle — press Start OCR to begin."));
         status.set_xalign(0.0);
@@ -476,21 +487,32 @@ impl Window {
         stack.add_named(&list_scroller, Some("list"));
         stack.set_visible_child_name("text");
 
-        let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        layout.append(&toolbar);
-        layout.append(&info_row);
-        layout.append(&preview_pane);
-        layout.append(&status);
-
         let mode_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        mode_row.set_margin_start(12);
+        mode_row.set_margin_start(6);
         mode_row.set_margin_end(12);
         mode_row.set_margin_bottom(6);
         mode_row.append(&gtk::Label::new(Some("Show as")));
         mode_row.append(&mode);
 
-        layout.append(&mode_row);
-        layout.append(&stack);
+        let output_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        output_pane.set_margin_start(6);
+        output_pane.set_margin_end(12);
+        output_pane.set_margin_bottom(8);
+        output_pane.append(&mode_row);
+        output_pane.append(&stack);
+
+        let split = gtk::Paned::new(gtk::Orientation::Horizontal);
+        split.set_start_child(Some(&preview_pane));
+        split.set_end_child(Some(&output_pane));
+        split.set_position(460);
+        split.set_vexpand(true);
+        split.set_wide_handle(true);
+
+        let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        layout.append(&toolbar);
+        layout.append(&info_row);
+        layout.append(&split);
+        layout.append(&status);
         root.set_child(Some(&layout));
 
         let settings = Arc::new(Mutex::new(Settings::default()));
@@ -639,20 +661,23 @@ impl Window {
 
         let begin = Rc::clone(&self.preview);
         drag.connect_drag_begin(move |_gesture, x, y| {
-            // The position where the button went down, relative to the
-            // widget allocation.
+            // Where the button went down, in the pixels of the widget, so
+            // the offset the drag reports can be added to it.
             begin.start.set(Some((x, y)));
+            let Some(fraction) = begin.to_fraction(x, y) else {
+                return;
+            };
             if let Some(handle) = begin.handle_at(x, y) {
                 let start = begin.crop.borrow().unwrap_or_default();
                 *begin.drag.borrow_mut() = Some(Drag::Resize { handle, start });
             } else if begin.inside_crop(x, y) {
                 let start = begin.crop.borrow().unwrap_or_default();
                 *begin.drag.borrow_mut() = Some(Drag::Move {
-                    grab: (x, y),
+                    grab: fraction,
                     start,
                 });
             } else {
-                *begin.drag.borrow_mut() = Some(Drag::New { anchor: (x, y) });
+                *begin.drag.borrow_mut() = Some(Drag::New { anchor: fraction });
                 *begin.crop.borrow_mut() = None;
             }
         });
@@ -664,27 +689,25 @@ impl Window {
             // the position is the start plus that offset.
             let (start_x, start_y) = update.start.get().unwrap_or((0.0, 0.0));
             let (x, y) = (start_x + offset_x, start_y + offset_y);
+            let Some(fraction) = update.to_fraction(x, y) else {
+                return;
+            };
 
             let current = update.drag.borrow().clone();
             match current {
                 Some(Drag::New { anchor }) => {
-                    *update.crop.borrow_mut() = Some(Crop {
-                        x: anchor.0.min(x),
-                        y: anchor.1.min(y),
-                        width: (x - anchor.0).abs(),
-                        height: (y - anchor.1).abs(),
-                    });
+                    *update.crop.borrow_mut() = Some(Region::from_corners(anchor, fraction));
                 }
                 Some(Drag::Move { grab, start }) => {
                     let mut crop = start;
-                    crop.x += x - grab.0;
-                    crop.y += y - grab.1;
+                    crop.x += fraction.0 - grab.0;
+                    crop.y += fraction.1 - grab.1;
                     update.clamp(&mut crop);
                     *update.crop.borrow_mut() = Some(crop);
                 }
                 Some(Drag::Resize { handle, start }) => {
                     let mut crop = start;
-                    resize(&mut crop, handle, x, y);
+                    resize(&mut crop, handle, fraction.0, fraction.1);
                     update.clamp(&mut crop);
                     *update.crop.borrow_mut() = Some(crop);
                 }
@@ -796,8 +819,14 @@ impl Window {
             .connect_clicked(move |_| owner.copy_all());
 
         let owner = Rc::clone(self);
-        self.clear_button
-            .connect_clicked(move |_| owner.clear());
+        self.clear_button.connect_clicked(move |_| {
+            owner.clear();
+            // The text that was already seen is forgotten too, so it is
+            // treated as new if it turns up again.
+            if let Some(pipeline) = owner.pipeline.borrow().as_ref() {
+                pipeline.clear_history();
+            }
+        });
 
         let owner = Rc::clone(self);
         self.auto_copy.connect_active_notify(move |switch| {
@@ -1200,17 +1229,42 @@ mod tests {
         preview.rect.set(Some((65.55555555555554, 10.0, 100.0, 50.0)));
 
         let mut crop = Crop {
-            x: 70.0,
-            y: 10.0,
-            width: 200.0,
-            height: 80.0,
+            x: 0.7,
+            y: 0.1,
+            width: 2.0,
+            height: 1.6,
         };
         preview.clamp(&mut crop);
 
-        assert!(crop.width <= 100.0, "the crop must fit the frame");
-        assert!(crop.height <= 50.0, "the crop must fit the frame");
-        assert!(crop.x >= 65.55555555555554);
-        assert!(crop.y >= 10.0);
+        assert!(crop.width <= 1.0, "the crop must fit the frame");
+        assert!(crop.height <= 1.0, "the crop must fit the frame");
+        assert!(crop.x >= 0.0);
+        assert!(crop.y >= 0.0);
+    }
+
+    /// The crop is kept as a fraction of the frame, so it stays where it was
+    /// when the window is resized and the preview is scaled differently.
+    #[test]
+    fn the_crop_does_not_move_when_the_preview_is_rescaled() {
+        let preview = Preview::new();
+        preview.rect.set(Some((0.0, 0.0, 800.0, 400.0)));
+        *preview.crop.borrow_mut() = Some(Crop {
+            x: 0.25,
+            y: 0.5,
+            width: 0.25,
+            height: 0.25,
+        });
+
+        let before = preview.crop_rect().expect("crop");
+        let region_before = preview.crop_region().expect("region");
+
+        // The window was resized, so the preview is drawn differently.
+        preview.rect.set(Some((0.0, 0.0, 400.0, 900.0)));
+        let after = preview.crop_rect().expect("crop");
+        let region_after = preview.crop_region().expect("region");
+
+        assert_eq!(region_before, region_after, "the region must not change");
+        assert_ne!(before, after, "but it is drawn in a different place");
     }
 
     /// The corner of the crop is the point the pointer went down on, with no
@@ -1265,8 +1319,8 @@ mod tests {
 
     #[test]
     fn a_crop_cannot_be_squeezed_out_of_existence() {
-        let mut crop = crop(200.0, 200.0, 400.0, 400.0);
-        resize(&mut crop, Handle::NorthWest, 900.0, 900.0);
+        let mut crop = crop(0.2, 0.2, 0.4, 0.4);
+        resize(&mut crop, Handle::NorthWest, 0.9, 0.9);
         assert!(crop.width >= MIN_CROP);
         assert!(crop.height >= MIN_CROP);
     }

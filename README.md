@@ -75,7 +75,12 @@ fraction of the frame, so it stays put when the captured window is resized.
 **Whole capture** goes back to recognising everything.
 
 **Show where text was found** draws a box around every line the recogniser
-picked up, so you can see where the text on screen came from.
+picked up, so you can see where the text on screen came from. The crop you
+draw on the preview is kept as a part of the frame, so resizing the window
+does not move it.
+
+**Clear** empties the output and also forgets what has been seen, so text that
+was already recognised is treated as new if it turns up again.
 
 **Show as** chooses how the recognised text is presented. **Text** is the
 plain box. **List** gives each new piece of text an entry with the frame it

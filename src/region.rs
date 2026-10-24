@@ -11,6 +11,16 @@ pub struct Region {
 }
 
 impl Region {
+    /// Builds a rectangle from two corners given in fractions.
+    pub fn from_corners(start: (f64, f64), end: (f64, f64)) -> Self {
+        Self {
+            x: start.0.min(end.0),
+            y: start.1.min(end.1),
+            width: (end.0 - start.0).abs(),
+            height: (end.1 - start.1).abs(),
+        }
+    }
+
     /// True when the rectangle covers nothing.
     pub fn is_empty(&self) -> bool {
         self.width <= 0.0 || self.height <= 0.0
