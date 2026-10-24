@@ -83,10 +83,19 @@ does not move it.
 was already recognised is treated as new if it turns up again.
 
 **Show as** chooses how the recognised text is presented. **Text** is the
-plain box. **List** gives each new piece of text an entry with the frame it
-came from, the text, and the time it was seen. Only the frame that carried
-new text is kept, and those pictures live in memory only, so nothing is left
-behind on disk.
+plain box. **List** gives each screen its own entry, with the frame it was
+seen in, the text read from it, and the time it was seen. More text from
+the same screen is added to the entry that is already there rather than
+making another one.
+
+The portal gives every screen or window an identifier that stays the same
+for as long as that thing is being captured, so entries are grouped by it
+rather than by comparing the pictures, which would be slow and would
+mistake two still frames for different ones.
+
+Only the frame that carried new text is kept, and those pictures live in
+memory only, so nothing is left behind on disk. They are shown at the size
+they were made, rather than being scaled to fit.
 
 **Settings** opens a panel with the two thresholds that decide whether two
 detections are in the same place, so they can be tuned while the app runs.

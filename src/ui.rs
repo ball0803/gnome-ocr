@@ -6,6 +6,7 @@
 //! selected and adjusted, and only that part of the frame is recognised.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +24,10 @@ const APP_ID: &str = "dev.local.gnome_ocr";
 
 /// How many entries the list keeps before the oldest are dropped.
 const MAX_LIST_ENTRIES: usize = 200;
+
+/// The width the pictures in the list are shown at. They are shown at the
+/// size they were made, rather than being scaled to fit a box of their own.
+const MAX_IMAGE_WIDTH: i32 = 480;
 
 /// How close the pointer has to be to a handle to grab it.
 const HANDLE_GRAB: f64 = 10.0;
@@ -296,6 +301,44 @@ fn resize(crop: &mut Crop, handle: Handle, x: f64, y: f64) {
     crop.height = bottom - top;
 }
 
+
+/// One entry in the list: the frame and everything read from it.
+struct ListEntry {
+    picture: gtk::Picture,
+    timestamp: gtk::Label,
+    content: gtk::Box,
+}
+
+
+impl ListEntry {
+    /// Adds more text to the entry and shows the newest frame.
+    fn append(&self, text: &str, image: Option<Vec<u8>>) {
+        if !text.is_empty() {
+            let label = gtk::Label::new(Some(text));
+            label.set_xalign(0.0);
+            label.set_yalign(0.0);
+            label.set_wrap(true);
+            label.set_selectable(true);
+            self.content.append(&label);
+        }
+        if let Some(png) = image
+            && let Ok(texture) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(png))
+        {
+            self.picture.set_paintable(Some(&texture));
+        }
+        self.timestamp.set_text(&timestamp_now());
+    }
+
+    /// Names the section the text belongs to.
+    fn set_section(&self, section: crate::layout::Heading) {
+        let heading = gtk::Label::new(Some(&section.text));
+        heading.set_xalign(0.0);
+        heading.add_css_class(&format!("title-{}", section.level));
+        heading.set_wrap(true);
+        self.content.append(&heading);
+    }
+}
+
 pub fn run(japanese_only: bool) -> glib::ExitCode {
     let app = gtk::Application::builder()
         .application_id(APP_ID)
@@ -333,6 +376,10 @@ struct Window {
     status: gtk::Label,
     preview: Rc<Preview>,
     region: Arc<Mutex<Option<Region>>>,
+    /// The source that is being captured, so entries can be grouped by it.
+    source_id: RefCell<String>,
+    /// The list entries, by the source they belong to.
+    entries: RefCell<HashMap<String, ListEntry>>,
     events: async_channel::Sender<Event>,
     restore_token: Arc<Mutex<Option<String>>>,
     pipeline: RefCell<Option<Pipeline>>,
@@ -504,7 +551,7 @@ impl Window {
         let split = gtk::Paned::new(gtk::Orientation::Horizontal);
         split.set_start_child(Some(&preview_pane));
         split.set_end_child(Some(&output_pane));
-        split.set_position(460);
+        split.set_position(560);
         split.set_vexpand(true);
         split.set_wide_handle(true);
 
@@ -546,6 +593,8 @@ impl Window {
             status,
             preview: Rc::new(Preview::new()),
             region: Arc::new(Mutex::new(None)),
+            source_id: RefCell::new(String::new()),
+            entries: RefCell::new(HashMap::new()),
             events,
             restore_token: Arc::new(Mutex::new(None)),
             pipeline: RefCell::new(None),
@@ -924,8 +973,12 @@ impl Window {
                 self.stop_button.set_sensitive(false);
                 self.change_button.set_sensitive(false);
             }
-            Event::Source(description) => {
+            Event::Source {
+                description,
+                source_id,
+            } => {
                 self.source_label.set_text(&description);
+                *self.source_id.borrow_mut() = source_id;
             }
             Event::Preview {
                 png,
@@ -950,6 +1003,19 @@ impl Window {
         blocks: &[crate::layout::Block],
         section: Option<crate::layout::Heading>,
     ) {
+        let source = self.source_id.borrow().clone();
+        let text = blocks
+            .iter()
+            .map(|block| block.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The same screen keeps one entry, and more text is added to it.
+        if let Some(entry) = self.entries.borrow_mut().get_mut(&source) {
+            entry.append(&text, image);
+            return;
+        }
+
         let row = gtk::ListBoxRow::new();
         let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         row_box.set_margin_top(8);
@@ -958,48 +1024,36 @@ impl Window {
         row_box.set_margin_end(8);
 
         let left = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        if let Some(section) = section {
-            let heading = gtk::Label::new(Some(&section.text));
-            heading.set_xalign(0.0);
-            heading.add_css_class(&format!("title-{}", section.level));
-            heading.set_wrap(true);
-            left.append(&heading);
-        }
         let timestamp = gtk::Label::new(Some(&timestamp_now()));
         timestamp.set_xalign(0.0);
         timestamp.add_css_class("dim-label");
         timestamp.add_css_class("caption");
         left.append(&timestamp);
 
-        if let Some(png) = image
-            && let Ok(texture) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(png))
-        {
-            let picture = gtk::Picture::new();
-            picture.set_paintable(Some(&texture));
-            picture.set_content_fit(gtk::ContentFit::Cover);
-            picture.set_size_request(160, 96);
-            picture.add_css_class("card");
-            left.append(&picture);
-        }
+        let picture = gtk::Picture::new();
+        picture.set_content_fit(gtk::ContentFit::Contain);
+        picture.set_size_request(MAX_IMAGE_WIDTH, -1);
+        picture.add_css_class("card");
+        left.append(&picture);
+
         row_box.append(&left);
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        for block in blocks {
-            let text = block.text();
-            let label = gtk::Label::new(Some(text));
-            label.set_xalign(0.0);
-            label.set_yalign(0.0);
-            label.set_wrap(true);
-            label.set_selectable(true);
-            if let crate::layout::Block::Heading { level, .. } = block {
-                label.add_css_class(&format!("title-{level}"));
-            }
-            content.append(&label);
-        }
         row_box.append(&content);
 
         row.set_child(Some(&row_box));
         self.list.append(&row);
+
+        let entry = ListEntry {
+            picture,
+            timestamp,
+            content,
+        };
+        entry.append(&text, image);
+        if let Some(section) = section {
+            entry.set_section(section);
+        }
+        self.entries.borrow_mut().insert(source, entry);
 
         // The pictures are kept in memory, so the list is not allowed to
         // grow for ever.
@@ -1045,6 +1099,7 @@ impl Window {
         while let Some(row) = self.list.first_child() {
             self.list.remove(&row);
         }
+        self.entries.borrow_mut().clear();
         self.set_status("Cleared.");
     }
 

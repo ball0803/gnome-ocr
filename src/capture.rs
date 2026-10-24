@@ -117,6 +117,7 @@ pub async fn start(restore_token: Option<String>) -> Result<(Capture, CaptureInf
         .context("portal returned no streams")?
         .to_owned();
     let description = describe(&stream);
+    let source_id = stream.id().unwrap_or_default().to_owned();
     tracing::info!(
         "portal v{} granted: node_id={} size={:?} position={:?} reused_grant={}",
         proxy.version(),
@@ -157,6 +158,7 @@ pub async fn start(restore_token: Option<String>) -> Result<(Capture, CaptureInf
         },
         CaptureInfo {
             description,
+            source_id,
             restore_token: token,
         },
     ))
@@ -166,6 +168,10 @@ pub async fn start(restore_token: Option<String>) -> Result<(Capture, CaptureInf
 pub struct CaptureInfo {
     /// A human readable summary, shown in the app.
     pub description: String,
+    /// An identifier for the source. The portal keeps it for the same screen
+    /// or window, so it is what tells whether two captures are of the same
+    /// thing.
+    pub source_id: String,
     /// The token that restores this choice on the next capture.
     pub restore_token: Option<String>,
 }

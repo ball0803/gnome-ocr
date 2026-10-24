@@ -45,8 +45,13 @@ pub enum Event {
         frame_width: u32,
         frame_height: u32,
     },
-    /// What the portal is sharing.
-    Source(String),
+    /// What the portal is sharing, and an identifier for it.
+    Source {
+        description: String,
+        /// The same for the same screen or window, so it can be used to
+        /// tell whether two captures are of the same thing.
+        source_id: String,
+    },
 }
 
 /// What the UI asks the pipeline to do.
@@ -201,7 +206,13 @@ fn run(
                             if let Ok(mut stored) = restore_token.lock() {
                                 *stored = info.restore_token.clone();
                             }
-                            emit(&events, Event::Source(info.description));
+                            emit(
+                                &events,
+                                Event::Source {
+                                    description: info.description,
+                                    source_id: info.source_id,
+                                },
+                            );
                         }
                         Err(err) => {
                             emit_terminal(&events, Event::Failed(format!("{err}")));
