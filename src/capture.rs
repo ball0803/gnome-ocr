@@ -258,11 +258,11 @@ fn run_pipewire(
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoFormat,
             Choice, Enum, Id,
-            pw::spa::param::video::VideoFormat::BGRx,
-            pw::spa::param::video::VideoFormat::BGRx,
-            pw::spa::param::video::VideoFormat::RGBx,
-            pw::spa::param::video::VideoFormat::RGBA,
             pw::spa::param::video::VideoFormat::RGB,
+            pw::spa::param::video::VideoFormat::RGB,
+            pw::spa::param::video::VideoFormat::RGBA,
+            pw::spa::param::video::VideoFormat::RGBx,
+            pw::spa::param::video::VideoFormat::BGRx,
         ),
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoSize,
@@ -273,9 +273,9 @@ fn run_pipewire(
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoFramerate,
             Choice, Range, Fraction,
-            pw::spa::utils::Fraction { num: 5, denom: 1 },
+            pw::spa::utils::Fraction { num: 25, denom: 1 },
             pw::spa::utils::Fraction { num: 0,  denom: 1 },
-            pw::spa::utils::Fraction { num: 30, denom: 1 }),
+            pw::spa::utils::Fraction { num: 1000, denom: 1 }),
     );
     let encoded = pw::spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
@@ -295,6 +295,11 @@ fn run_pipewire(
         )
         .context("connect stream")?;
     tracing::info!("pipewire connected; entering mainloop");
+
+    // Without this the stream sits in Paused forever and never negotiates a
+    // format, so no buffers are ever delivered.
+    stream.set_active(true).context("activate stream")?;
+    tracing::info!("stream activated");
 
     mainloop.run();
     tracing::info!("pipewire mainloop exited");
