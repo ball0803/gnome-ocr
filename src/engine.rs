@@ -54,6 +54,17 @@ struct AxisAlignedBox {
 #[derive(Debug, Default, Clone)]
 pub struct ScanResult {
     pub detections: Vec<crate::dedupe::Detection>,
+    /// The part of the frame that was scanned, so it can be kept alongside
+    /// the text that came from it.
+    pub scanned: Option<ScannedImage>,
+}
+
+/// The pixels that were read, in RGBA8.
+#[derive(Debug, Clone)]
+pub struct ScannedImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: std::sync::Arc<Vec<u8>>,
 }
 
 
@@ -204,10 +215,17 @@ impl Engine {
                 .unwrap_or_else(|| (rgba.to_vec(), width, height, 0, 0)),
             None => (rgba.to_vec(), width, height, 0, 0),
         };
+        let pixels = std::sync::Arc::new(pixels);
         let outcome = match write_png(&self.scratch, &pixels, width, height) {
             Ok(()) => {
                 self.report_frame(width, height);
-                self.exchange(origin_x, origin_y)
+                self.exchange(
+                    origin_x,
+                    origin_y,
+                    std::sync::Arc::clone(&pixels),
+                    width,
+                    height,
+                )
             }
             Err(err) => Err(err),
         };
@@ -243,7 +261,14 @@ impl Engine {
     /// The boxes come back relative to the image that was scanned, so the
     /// origin of the crop is added back to put them where they are in the
     /// frame.
-    fn exchange(&mut self, origin_x: u32, origin_y: u32) -> Result<ScanResult> {
+    fn exchange(
+        &mut self,
+        origin_x: u32,
+        origin_y: u32,
+        scanned: std::sync::Arc<Vec<u8>>,
+        scanned_width: u32,
+        scanned_height: u32,
+    ) -> Result<ScanResult> {
         let command = format!(
             "scanfile {} {}\n",
             if self.japanese_only { "true" } else { "false" },
@@ -319,7 +344,14 @@ impl Engine {
             }
         }
 
-        Ok(ScanResult { detections })
+        Ok(ScanResult {
+            detections,
+            scanned: Some(ScannedImage {
+                width: scanned_width,
+                height: scanned_height,
+                rgba: scanned,
+            }),
+        })
     }
 }
 

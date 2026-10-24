@@ -28,6 +28,10 @@ pub enum Event {
         found: Vec<crate::dedupe::Detection>,
         /// How many new detections there have been in total.
         total: usize,
+        /// A picture of the part of the frame the new text came from. It is
+        /// only made when there is new text, so the frames that carried
+        /// nothing are never kept.
+        image: Option<Vec<u8>>,
     },
     Failed(String),
     Stopped,
@@ -268,12 +272,27 @@ fn run(
                         found.push(detection);
                     }
                     total += fresh.len();
+                    // The picture is only made when there is new text, so
+                    // the frames that carried nothing are not kept.
+                    let image = if fresh.is_empty() {
+                        None
+                    } else {
+                        scan.scanned.and_then(|scanned| {
+                            crate::preview::preview_png(
+                                &scanned.rgba,
+                                scanned.width,
+                                scanned.height,
+                                480,
+                            )
+                        })
+                    };
                     emit(
                         &events,
                         Event::Scanned {
                             fresh,
                             found,
                             total,
+                            image,
                         },
                     );
                 }

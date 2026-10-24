@@ -77,6 +77,12 @@ fraction of the frame, so it stays put when the captured window is resized.
 **Show where text was found** draws a box around every line the recogniser
 picked up, so you can see where the text on screen came from.
 
+**Show as** chooses how the recognised text is presented. **Text** is the
+plain box. **List** gives each new piece of text an entry with the frame it
+came from, the text, and the time it was seen. Only the frame that carried
+new text is kept, and those pictures live in memory only, so nothing is left
+behind on disk.
+
 **Settings** opens a panel with the two thresholds that decide whether two
 detections are in the same place, so they can be tuned while the app runs.
 

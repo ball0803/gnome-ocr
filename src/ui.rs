@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use async_channel::Receiver;
+use gtk::gdk;
 use gtk::gdk::prelude::*;
 use gtk::prelude::*;
 use gtk::{cairo, gio, glib};
@@ -19,6 +20,9 @@ use crate::pipeline::{Event, Pipeline};
 use crate::region::Region;
 
 const APP_ID: &str = "dev.local.gnome_ocr";
+
+/// How many entries the list keeps before the oldest are dropped.
+const MAX_LIST_ENTRIES: usize = 200;
 
 /// How close the pointer has to be to a handle to grab it.
 const HANDLE_GRAB: f64 = 10.0;
@@ -313,6 +317,9 @@ struct Window {
     change_button: gtk::Button,
     reset_button: gtk::Button,
     show_boxes: gtk::CheckButton,
+    mode: gtk::DropDown,
+    stack: gtk::Stack,
+    list: gtk::ListBox,
     settings_button: gtk::Button,
     popover: gtk::Popover,
     settings: Arc<Mutex<Settings>>,
@@ -426,6 +433,10 @@ impl Window {
         status.set_margin_top(6);
         status.set_margin_bottom(6);
 
+        let mode = gtk::DropDown::from_strings(&["Text", "List"]);
+        mode.set_valign(gtk::Align::Center);
+        mode.set_tooltip_text(Some("How the recognised text is shown."));
+
         let text_view = gtk::TextView::new();
         text_view.set_editable(false);
         text_view.set_cursor_visible(true);
@@ -448,12 +459,38 @@ impl Window {
             .margin_bottom(12)
             .build();
 
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.add_css_class("boxed-list");
+        let list_scroller = gtk::ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .child(&list)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(12)
+            .build();
+
+        let stack = gtk::Stack::new();
+        stack.add_named(&scroller, Some("text"));
+        stack.add_named(&list_scroller, Some("list"));
+        stack.set_visible_child_name("text");
+
         let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
         layout.append(&toolbar);
         layout.append(&info_row);
         layout.append(&preview_pane);
         layout.append(&status);
-        layout.append(&scroller);
+
+        let mode_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        mode_row.set_margin_start(12);
+        mode_row.set_margin_end(12);
+        mode_row.set_margin_bottom(6);
+        mode_row.append(&gtk::Label::new(Some("Show as")));
+        mode_row.append(&mode);
+
+        layout.append(&mode_row);
+        layout.append(&stack);
         root.set_child(Some(&layout));
 
         let settings = Arc::new(Mutex::new(Settings::default()));
@@ -473,6 +510,9 @@ impl Window {
             change_button,
             reset_button,
             show_boxes,
+            mode,
+            stack,
+            list,
             settings_button,
             popover,
             settings: settings.clone(),
@@ -732,6 +772,15 @@ impl Window {
         });
 
         let owner = Rc::clone(self);
+        self.mode.connect_selected_notify(move |mode| {
+            let page = match mode.selected() {
+                1 => "list",
+                _ => "text",
+            };
+            owner.stack.set_visible_child_name(page);
+        });
+
+        let owner = Rc::clone(self);
         self.show_boxes.connect_toggled(move |button| {
             owner.preview.show_boxes.set(button.is_active());
             owner.canvas.queue_draw();
@@ -818,6 +867,7 @@ impl Window {
                 fresh,
                 found,
                 total,
+                image,
             } => {
                 *self.preview.detections.borrow_mut() = found;
                 self.canvas.queue_draw();
@@ -832,6 +882,9 @@ impl Window {
                     if self.auto_copy.is_active() {
                         self.root.clipboard().set_text(&joined);
                     }
+                    // The list keeps the picture of the frame the text came
+                    // from, so it can be shown next to the text.
+                    self.add_list_entry(image, &joined);
                 }
                 self.set_status(&format!("{total} line(s) captured."));
             }
@@ -860,6 +913,64 @@ impl Window {
         }
     }
 
+    /// Adds an entry to the list, showing the frame the text came from.
+    fn add_list_entry(&self, image: Option<Vec<u8>>, text: &str) {
+        let row = gtk::ListBoxRow::new();
+        let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        row_box.set_margin_top(8);
+        row_box.set_margin_bottom(8);
+        row_box.set_margin_start(8);
+        row_box.set_margin_end(8);
+
+        let left = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let timestamp = gtk::Label::new(Some(&timestamp_now()));
+        timestamp.set_xalign(0.0);
+        timestamp.add_css_class("dim-label");
+        timestamp.add_css_class("caption");
+        left.append(&timestamp);
+
+        if let Some(png) = image
+            && let Ok(texture) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(png))
+        {
+            let picture = gtk::Picture::new();
+            picture.set_paintable(Some(&texture));
+            picture.set_content_fit(gtk::ContentFit::Cover);
+            picture.set_size_request(160, 96);
+            picture.add_css_class("card");
+            left.append(&picture);
+        }
+        row_box.append(&left);
+
+        let content = gtk::Label::new(Some(text));
+        content.set_xalign(0.0);
+        content.set_yalign(0.0);
+        content.set_wrap(true);
+        content.set_selectable(true);
+        row_box.append(&content);
+
+        row.set_child(Some(&row_box));
+        self.list.append(&row);
+
+        // The pictures are kept in memory, so the list is not allowed to
+        // grow for ever.
+        while self.list.first_child().is_some() && self.list_count() > MAX_LIST_ENTRIES {
+            let Some(first) = self.list.first_child() else {
+                break;
+            };
+            self.list.remove(&first);
+        }
+    }
+
+    fn list_count(&self) -> usize {
+        let mut count = 0;
+        let mut child = self.list.first_child();
+        while let Some(row) = child {
+            count += 1;
+            child = row.next_sibling();
+        }
+        count
+    }
+
     fn append(&self, text: &str) {
         self.lines.borrow_mut().push(text.to_owned());
         let all = self.lines.borrow().concat();
@@ -881,6 +992,9 @@ impl Window {
     fn clear(&self) {
         self.lines.borrow_mut().clear();
         self.buffer.set_text("");
+        while let Some(row) = self.list.first_child() {
+            self.list.remove(&row);
+        }
         self.set_status("Cleared.");
     }
 
@@ -950,6 +1064,15 @@ fn labelled(text: &str, control: &gtk::SpinButton, tooltip: &str) -> gtk::Box {
     row
 }
 
+/// The current local time, as it is shown beside a list entry.
+fn timestamp_now() -> String {
+    glib::DateTime::now_local()
+        .ok()
+        .and_then(|time| time.format("%b %e %l:%M %p").ok())
+        .map(|time| time.to_string())
+        .unwrap_or_default()
+}
+
 fn pill(label: &str, style: Option<&str>) -> gtk::Button {
     let button = gtk::Button::with_label(label);
     button.add_css_class("pill");
@@ -975,6 +1098,13 @@ mod tests {
     /// GtkGestureDrag reports the offset from the point the drag started at,
     /// so the position of the pointer is the start plus that offset.
     #[test]
+    /// The timestamp shown beside a list entry.
+    #[test]
+    fn the_timestamp_is_not_empty() {
+        let timestamp = timestamp_now();
+        assert!(!timestamp.is_empty(), "the timestamp should be written");
+    }
+
     /// The scaled copy of the preview was cached by size alone, so every
     /// later frame of the same size was served from the cache and the
     /// preview stayed on the first frame.
