@@ -594,6 +594,7 @@ dependencies = [
  "anyhow",
  "ashpd",
  "async-channel",
+ "cairo-rs",
  "gtk4",
  "image",
  "pipewire",

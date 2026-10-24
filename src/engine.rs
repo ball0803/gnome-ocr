@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::process::{Child, ChildStdin, Command, Stdio};
 
 use anyhow::{Context, Result};
@@ -112,6 +112,7 @@ impl Drop for Process {
 pub struct Engine {
     process: Process,
     cancel: Arc<AtomicBool>,
+    region: Arc<Mutex<Option<crate::region::Region>>>,
     japanese_only: bool,
     scratch: PathBuf,
     dump_dir: Option<PathBuf>,
@@ -125,10 +126,15 @@ impl Engine {
     ///
     /// `cancel` is shared with the pipeline so that stopping abandons a scan
     /// that is already in flight instead of waiting for it to finish.
-    pub fn spawn(japanese_only: bool, cancel: Arc<AtomicBool>) -> Result<Self> {
+    pub fn spawn(
+        japanese_only: bool,
+        cancel: Arc<AtomicBool>,
+        region: Arc<Mutex<Option<crate::region::Region>>>,
+    ) -> Result<Self> {
         Ok(Self {
             process: Process::spawn()?,
             cancel,
+            region,
             japanese_only,
             scratch: scratch_path(),
             dump_dir: dump_dir(),
@@ -144,7 +150,13 @@ impl Engine {
     /// from a clean daemon, then reports the error to the caller.
     pub fn scan(&mut self, rgba: &[u8], width: u32, height: u32) -> Result<ScanResult> {
         self.frames += 1;
-        let outcome = match write_png(&self.scratch, rgba, width, height) {
+        let selected = self.region.lock().ok().and_then(|region| *region);
+        let (pixels, width, height) = match selected {
+            Some(region) => crop(rgba, width, height, region)
+                .unwrap_or_else(|| (rgba.to_vec(), width, height)),
+            None => (rgba.to_vec(), width, height),
+        };
+        let outcome = match write_png(&self.scratch, &pixels, width, height) {
             Ok(()) => {
                 self.report_frame(width, height);
                 self.exchange()
@@ -249,6 +261,45 @@ impl Drop for Engine {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.scratch);
     }
+}
+
+
+/// Cuts the frame down to the selected part.
+///
+/// The region is in fractions of the frame, so it stays correct when the
+/// captured window is resized. Returns None when the region covers nothing.
+fn crop(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    region: crate::region::Region,
+) -> Option<(Vec<u8>, u32, u32)> {
+    if region.is_empty() {
+        return None;
+    }
+    let limit_x = width as f64;
+    let limit_y = height as f64;
+    let x0 = (region.x * limit_x).round().clamp(0.0, limit_x) as u32;
+    let y0 = (region.y * limit_y).round().clamp(0.0, limit_y) as u32;
+    let x1 = ((region.x + region.width) * limit_x)
+        .round()
+        .clamp(0.0, limit_x) as u32;
+    let y1 = ((region.y + region.height) * limit_y)
+        .round()
+        .clamp(0.0, limit_y) as u32;
+    let cropped_width = x1.saturating_sub(x0);
+    let cropped_height = y1.saturating_sub(y0);
+    if cropped_width == 0 || cropped_height == 0 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity((cropped_width * cropped_height * 4) as usize);
+    for y in y0..y1 {
+        let start = ((y as usize * width as usize) + x0 as usize) * 4;
+        let end = start + cropped_width as usize * 4;
+        out.extend_from_slice(rgba.get(start..end)?);
+    }
+    Some((out, cropped_width, cropped_height))
 }
 
 /// Each engine needs its own scratch file: two engines sharing one path race
@@ -376,7 +427,11 @@ mod tests {
     #[test]
     fn recognises_text_rendered_into_a_frame() {
         let (width, height, rgba) = render_text("HELLO WORLD 12345");
-        let mut engine = Engine::spawn(false, Arc::new(AtomicBool::new(false))).expect("spawn qocrd");
+        let mut engine = Engine::spawn(
+            false,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+        ).expect("spawn qocrd");
         let result = engine.scan(&rgba, width, height).expect("scan should succeed");
 
         assert!(!result.lines.is_empty(), "qocrd returned no text");
@@ -392,14 +447,22 @@ mod tests {
     #[test]
     fn returns_no_text_for_a_blank_frame_instead_of_erroring() {
         let (width, height, rgba) = render_text("");
-        let mut engine = Engine::spawn(false, Arc::new(AtomicBool::new(false))).expect("spawn qocrd");
+        let mut engine = Engine::spawn(
+            false,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+        ).expect("spawn qocrd");
         let result = engine.scan(&rgba, width, height).expect("blank frame must not error");
         assert!(result.lines.is_empty(), "expected no lines, got {:?}", result.lines);
     }
 
     #[test]
     fn rejects_a_frame_whose_size_does_not_match_its_pixels() {
-        let mut engine = Engine::spawn(false, Arc::new(AtomicBool::new(false))).expect("spawn qocrd");
+        let mut engine = Engine::spawn(
+            false,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+        ).expect("spawn qocrd");
         let too_small = vec![0u8; 16];
         assert!(engine.scan(&too_small, 100, 100).is_err());
     }

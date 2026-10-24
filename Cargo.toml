@@ -13,6 +13,7 @@ path = "legacy/examples/screencast_smoke.rs"
 
 [dependencies]
 gtk = { version = "0.11", package = "gtk4", features = ["gnome_48"] }
+cairo = { package = "cairo-rs", version = "0.22", features = ["png"] }
 
 async-channel = "2"
 

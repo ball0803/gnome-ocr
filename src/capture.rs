@@ -91,7 +91,7 @@ impl Drop for Capture {
 /// appear behind the window.
 ///
 /// Returns after the portal handshake, before any frame has arrived.
-pub async fn start(restore_token: Option<String>) -> Result<(Capture, Option<String>)> {
+pub async fn start(restore_token: Option<String>) -> Result<(Capture, CaptureInfo)> {
     tracing::info!("asking the portal for a screen capture");
     let proxy = Screencast::new().await?;
     let session = proxy.create_session(Default::default()).await?;
@@ -116,6 +116,7 @@ pub async fn start(restore_token: Option<String>) -> Result<(Capture, Option<Str
         .first()
         .context("portal returned no streams")?
         .to_owned();
+    let description = describe(&stream);
     tracing::info!(
         "portal v{} granted: node_id={} size={:?} position={:?} reused_grant={}",
         proxy.version(),
@@ -154,8 +155,38 @@ pub async fn start(restore_token: Option<String>) -> Result<(Capture, Option<Str
             worker: Some(worker),
             session,
         },
-        token,
+        CaptureInfo {
+            description,
+            restore_token: token,
+        },
     ))
+}
+
+/// What the portal is sharing.
+pub struct CaptureInfo {
+    /// A human readable summary, shown in the app.
+    pub description: String,
+    /// The token that restores this choice on the next capture.
+    pub restore_token: Option<String>,
+}
+
+/// Summarises the shared source. The portal reports the kind of source and
+/// its identifier, but no window title.
+fn describe(stream: &ashpd::desktop::screencast::Stream) -> String {
+    let kind = match stream.source_type() {
+        Some(SourceType::Monitor) => "Screen",
+        Some(SourceType::Window) => "Window",
+        _ => "Source",
+    };
+    let identifier = stream.id().unwrap_or("unknown");
+    let size = match stream.size() {
+        Some((width, height)) => format!("{width}x{height}"),
+        None => "unknown size".to_string(),
+    };
+    match stream.position() {
+        Some((x, y)) => format!("{kind} {identifier} at {x},{y} ({size})"),
+        None => format!("{kind} {identifier} ({size})"),
+    }
 }
 
 fn run_pipewire(
@@ -516,7 +547,7 @@ mod tests {
             let pod = pw::spa::pod::Pod::from_bytes(&worker).expect("pod");
             let info = std::sync::Mutex::new(VideoInfoRaw::new());
             let result = apply_negotiated_format(&info, pod);
-            let _ = tx.send(result.map(|(w, h, f)| (w, h, f)));
+            let _ = tx.send(result);
         });
 
         let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));

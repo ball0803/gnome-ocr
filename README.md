@@ -63,6 +63,12 @@ a new capture.
 portal asks again which screen or window to use, instead of restoring the
 previous choice.
 
+The preview shows what is being captured, along with the kind of source and
+its size. Drag across the preview to recognise only that part of the frame;
+the rest of the screen is ignored. The selection is kept as a fraction of the
+frame, so it stays put when the captured window is resized. **Whole capture**
+goes back to recognising everything.
+
 Toggle **Auto-copy new text** to control whether new lines are copied to your
 clipboard; **Copy all** copies everything shown; **Clear** empties the view
 and resets the de-duplication set.

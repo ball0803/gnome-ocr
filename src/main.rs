@@ -8,6 +8,8 @@ mod capture;
 mod engine;
 mod paths;
 mod pipeline;
+mod preview;
+mod region;
 mod ui;
 
 use std::io::Write;

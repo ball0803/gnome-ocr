@@ -23,6 +23,10 @@ pub enum Event {
     Fresh { lines: Vec<String>, total: usize },
     Failed(String),
     Stopped,
+    /// A small PNG of the captured frame, for the preview pane.
+    Preview(Vec<u8>),
+    /// What the portal is sharing.
+    Source(String),
 }
 
 /// What the UI asks the pipeline to do.
@@ -47,6 +51,7 @@ impl Pipeline {
         events: Sender<Event>,
         japanese_only: bool,
         restore_token: Arc<Mutex<Option<String>>>,
+        region: Arc<Mutex<Option<crate::region::Region>>>,
     ) -> Self {
         let (commands, inbox) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -54,7 +59,16 @@ impl Pipeline {
 
         std::thread::Builder::new()
             .name("gnome-ocr-pipeline".into())
-            .spawn(move || run(events, inbox, thread_shutdown, japanese_only, restore_token))
+            .spawn(move || {
+                run(
+                    events,
+                    inbox,
+                    thread_shutdown,
+                    japanese_only,
+                    restore_token,
+                    region,
+                )
+            })
             .expect("spawn pipeline thread");
 
         Self {
@@ -93,6 +107,7 @@ fn run(
     shutdown: Arc<AtomicBool>,
     japanese_only: bool,
     restore_token: Arc<Mutex<Option<String>>>,
+    region: Arc<Mutex<Option<crate::region::Region>>>,
 ) {
     guarded(&events, || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -111,6 +126,7 @@ fn run(
         let mut seen: HashSet<String> = HashSet::new();
         let mut total: usize = 0;
         let mut recognising = false;
+        let mut last_preview = std::time::Instant::now() - Duration::from_millis(400);
 
         while !shutdown.load(Ordering::Relaxed) {
             let mut begin = false;
@@ -143,14 +159,15 @@ fn run(
                     tracing::info!("opening the screen capture, this asks for permission");
                     let token = restore_token.lock().ok().and_then(|token| token.clone());
                     match runtime.block_on(crate::capture::start(token)) {
-                        Ok((opened, token)) => {
+                        Ok((opened, info)) => {
                             capture = Some(opened);
                             // The portal consumes the token that was sent,
                             // so the stored one is replaced even when the
                             // reply carries none.
                             if let Ok(mut stored) = restore_token.lock() {
-                                *stored = token;
+                                *stored = info.restore_token.clone();
                             }
+                            emit(&events, Event::Source(info.description));
                         }
                         Err(err) => {
                             emit_terminal(&events, Event::Failed(format!("{err}")));
@@ -159,7 +176,11 @@ fn run(
                     }
                 }
                 if engine.is_none() {
-                    engine = match Engine::spawn(japanese_only, Arc::clone(&shutdown)) {
+                    engine = match Engine::spawn(
+                        japanese_only,
+                        Arc::clone(&shutdown),
+                        Arc::clone(&region),
+                    ) {
                         Ok(engine) => Some(engine),
                         Err(err) => {
                             emit_terminal(&events, Event::Failed(format!("{err}")));
@@ -203,6 +224,14 @@ fn run(
             let Some(frame) = capture.try_next_frame() else {
                 continue;
             };
+
+            if last_preview.elapsed() >= Duration::from_millis(400) {
+                last_preview = std::time::Instant::now();
+                if let Some(png) = crate::preview::preview_png(&frame.rgba, frame.width, frame.height, 640)
+                {
+                    emit(&events, Event::Preview(png));
+                }
+            }
 
             match engine.scan(&frame.rgba, frame.width, frame.height) {
                 Ok(scan) => {
