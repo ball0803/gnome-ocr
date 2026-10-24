@@ -56,6 +56,41 @@ pub struct ScanResult {
     pub detections: Vec<crate::dedupe::Detection>,
 }
 
+
+/// Reads replies from qocrd and hands them over a channel.
+///
+/// qocrd ends every reply with a NUL byte, so each reply is read up to its
+/// NUL and parsed on its own. Reading the output as a stream of JSON values
+/// instead would run into that byte after the first reply.
+fn read_replies(
+    mut reader: impl std::io::BufRead,
+    sender: std::sync::mpsc::Sender<Result<ScanFileResponse, serde_json::Error>>,
+) {
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        match reader.read_until(b'\0', &mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {
+                if buffer.last() == Some(&0) {
+                    buffer.pop();
+                }
+                if buffer.is_empty() {
+                    continue;
+                }
+                let reply = serde_json::from_slice::<ScanFileResponse>(&buffer);
+                if sender.send(reply).is_err() {
+                    break;
+                }
+            }
+            Err(err) => {
+                tracing::warn!("reading qocrd failed: {err}");
+                break;
+            }
+        }
+    }
+}
+
 /// How long to wait for qocrd to answer a scan.
 const SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -94,17 +129,15 @@ impl Process {
         // A reader thread owns the output stream and hands parsed replies
         // over a channel, so a scan can wait with a deadline instead of
         // blocking forever on a daemon that stopped answering.
+        //
+        // qocrd ends every reply with a NUL byte. Reading the output as a
+        // stream of JSON values would run into that byte after the first
+        // reply and fail to parse, so each reply is read up to its NUL.
         let (sender, responses) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("qocrd-reader".into())
             .spawn(move || {
-                let replies =
-                    serde_json::Deserializer::from_reader(stdout).into_iter::<ScanFileResponse>();
-                for reply in replies {
-                    if sender.send(reply).is_err() {
-                        break;
-                    }
-                }
+                read_replies(std::io::BufReader::new(stdout), sender);
             })
             .context("spawn qocrd reader thread")?;
 
@@ -487,6 +520,35 @@ mod tests {
         ).expect("spawn qocrd");
         let result = engine.scan(&rgba, width, height).expect("blank frame must not error");
         assert!(result.detections.is_empty(), "expected no detections, got {:?}", result.detections);
+    }
+
+    /// qocrd ends every reply with a NUL byte, so the reader has to split
+    /// on it. Reading the output as a stream of JSON values would fail on
+    /// the byte after the first reply.
+    #[test]
+    fn replies_are_split_on_the_nul_that_ends_them() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let data = "{\"lines\":[{\"text\":\"one\"}]}\0{\"lines\":[{\"text\":\"two\"}]}\0";
+
+        read_replies(std::io::BufReader::new(std::io::Cursor::new(data)), sender);
+
+        let first = receiver.recv().expect("first reply").expect("first parses");
+        let second = receiver.recv().expect("second reply").expect("second parses");
+        assert_eq!(first.lines[0].text, "one");
+        assert_eq!(second.lines[0].text, "two");
+    }
+
+    /// A reply that is not followed by a NUL is still read at the end of
+    /// the stream.
+    #[test]
+    fn a_last_reply_without_a_nul_is_still_read() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let data = "{\"lines\":[{\"text\":\"only\"}]}";
+
+        read_replies(std::io::BufReader::new(std::io::Cursor::new(data)), sender);
+
+        let reply = receiver.recv().expect("reply").expect("parses");
+        assert_eq!(reply.lines[0].text, "only");
     }
 
     #[test]

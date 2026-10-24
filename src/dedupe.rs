@@ -5,15 +5,30 @@
 //! that looks like the same place.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-/// How much two boxes have to overlap to count as the same place.
+/// The thresholds that decide whether two detections are in the same place.
 ///
-/// This is the usual threshold for "the same object" in detection work.
-pub const OVERLAP_THRESHOLD: f64 = 0.5;
+/// They can be changed while the app runs.
+#[derive(Debug, Clone, Copy)]
+pub struct Settings {
+    /// How much two boxes have to overlap to count as the same place.
+    ///
+    /// This is the usual threshold for "the same object" in detection work.
+    pub overlap: f64,
+    /// How alike two boxes have to be in size to count as the same place
+    /// even when they do not overlap.
+    pub dimension: f64,
+}
 
-/// How alike two boxes have to be in size to count as the same place even
-/// when they do not overlap.
-pub const DIMENSION_THRESHOLD: f64 = 0.9;
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            overlap: 0.5,
+            dimension: 0.9,
+        }
+    }
+}
 
 /// An axis-aligned rectangle in the pixels of the captured frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -82,14 +97,22 @@ pub struct Detection {
 }
 
 /// What has been seen so far, so repeats can be told apart.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct History {
     entries: HashMap<String, Vec<Box>>,
+    settings: Arc<Mutex<Settings>>,
 }
 
 impl History {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(settings: Arc<Mutex<Settings>>) -> Self {
+        Self {
+            entries: HashMap::new(),
+            settings,
+        }
+    }
+
+    fn thresholds(&self) -> Settings {
+        self.settings.lock().map(|settings| *settings).unwrap_or_default()
     }
 
     /// Whether this detection is something the user has not seen before.
@@ -103,9 +126,10 @@ impl History {
             return true;
         };
 
+        let thresholds = self.thresholds();
         let same_place = previous.iter().any(|previous_box| {
-            overlap(previous_box, &detection.bounds) >= OVERLAP_THRESHOLD
-                || dimension_similarity(previous_box, &detection.bounds) >= DIMENSION_THRESHOLD
+            overlap(previous_box, &detection.bounds) >= thresholds.overlap
+                || dimension_similarity(previous_box, &detection.bounds) >= thresholds.dimension
         });
 
         if !same_place {
@@ -194,7 +218,7 @@ mod tests {
 
     #[test]
     fn the_same_text_in_the_same_place_is_not_new() {
-        let mut history = History::new();
+        let mut history = History::new(Arc::new(Mutex::new(Settings::default())));
         let first = detection("hello", box_at(10.0, 10.0, 80.0, 20.0));
         assert!(history.is_new(&first));
 
@@ -204,7 +228,7 @@ mod tests {
 
     #[test]
     fn the_same_text_somewhere_else_of_the_same_size_is_not_new() {
-        let mut history = History::new();
+        let mut history = History::new(Arc::new(Mutex::new(Settings::default())));
         assert!(history.is_new(&detection("hello", box_at(10.0, 10.0, 80.0, 20.0))));
 
         let elsewhere = detection("hello", box_at(600.0, 400.0, 80.0, 20.0));
@@ -213,7 +237,7 @@ mod tests {
 
     #[test]
     fn the_same_text_in_a_different_size_is_new() {
-        let mut history = History::new();
+        let mut history = History::new(Arc::new(Mutex::new(Settings::default())));
         assert!(history.is_new(&detection("hello", box_at(10.0, 10.0, 80.0, 20.0))));
 
         let bigger = detection("hello", box_at(600.0, 400.0, 400.0, 120.0));
@@ -222,7 +246,7 @@ mod tests {
 
     #[test]
     fn different_text_is_always_new() {
-        let mut history = History::new();
+        let mut history = History::new(Arc::new(Mutex::new(Settings::default())));
         assert!(history.is_new(&detection("hello", box_at(10.0, 10.0, 80.0, 20.0))));
 
         let other = detection("goodbye", box_at(10.0, 10.0, 80.0, 20.0));

@@ -14,7 +14,7 @@ use gtk::gdk::prelude::*;
 use gtk::prelude::*;
 use gtk::{cairo, gio, glib};
 
-use crate::dedupe::Detection;
+use crate::dedupe::{Detection, Settings};
 use crate::pipeline::{Event, Pipeline};
 use crate::region::Region;
 
@@ -167,6 +167,11 @@ impl Preview {
         let Some((left, top, width, height)) = self.rect.get() else {
             return;
         };
+        // The crop is made to fit first. Otherwise the bounds below would
+        // have a maximum below their minimum, and clamping to them would
+        // fail outright.
+        crop.width = crop.width.min(width);
+        crop.height = crop.height.min(height);
         crop.x = crop.x.clamp(left, left + width - crop.width);
         crop.y = crop.y.clamp(top, top + height - crop.height);
     }
@@ -297,6 +302,9 @@ struct Window {
     change_button: gtk::Button,
     reset_button: gtk::Button,
     show_boxes: gtk::CheckButton,
+    settings_button: gtk::Button,
+    popover: gtk::Popover,
+    settings: Arc<Mutex<Settings>>,
     copy_button: gtk::Button,
     clear_button: gtk::Button,
     auto_copy: gtk::Switch,
@@ -335,6 +343,10 @@ impl Window {
 
         let copy_button = pill("Copy all", None);
         let clear_button = pill("Clear", None);
+        let settings_button = pill("Settings", None);
+        settings_button.set_tooltip_text(Some(
+            "How strictly text has to match to count as the same text.",
+        ));
 
         let auto_copy = gtk::Switch::builder()
             .valign(gtk::Align::Center)
@@ -355,6 +367,7 @@ impl Window {
         toolbar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         toolbar.append(&copy_button);
         toolbar.append(&clear_button);
+        toolbar.append(&settings_button);
 
         let source_label = gtk::Label::new(Some("Not capturing yet."));
         source_label.set_xalign(0.0);
@@ -432,6 +445,11 @@ impl Window {
         layout.append(&scroller);
         root.set_child(Some(&layout));
 
+        let settings = Arc::new(Mutex::new(Settings::default()));
+        let popover = gtk::Popover::new();
+        popover.set_parent(&settings_button);
+        popover.set_child(Some(&settings_panel(settings.clone())));
+
         let (events, inbox) = async_channel::bounded::<Event>(64);
 
         let window = Rc::new(Self {
@@ -444,6 +462,9 @@ impl Window {
             change_button,
             reset_button,
             show_boxes,
+            settings_button,
+            popover,
+            settings: settings.clone(),
             copy_button,
             clear_button,
             auto_copy,
@@ -695,6 +716,11 @@ impl Window {
             .connect_clicked(move |_| owner.change_source());
 
         let owner = Rc::clone(self);
+        self.settings_button.connect_clicked(move |_| {
+            owner.popover.popup();
+        });
+
+        let owner = Rc::clone(self);
         self.show_boxes.connect_toggled(move |button| {
             owner.preview.show_boxes.set(button.is_active());
             owner.canvas.queue_draw();
@@ -748,6 +774,7 @@ impl Window {
                 self.japanese_only,
                 Arc::clone(&self.restore_token),
                 Arc::clone(&self.region),
+                Arc::clone(&self.settings),
             );
             *self.pipeline.borrow_mut() = Some(pipeline);
         }
@@ -857,6 +884,61 @@ impl Window {
     }
 }
 
+/// The settings popover, with a control for each threshold.
+fn settings_panel(settings: Arc<Mutex<Settings>>) -> gtk::Box {
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    panel.set_margin_top(12);
+    panel.set_margin_bottom(12);
+    panel.set_margin_start(12);
+    panel.set_margin_end(12);
+
+    let current = settings.lock().map(|settings| *settings).unwrap_or_default();
+
+    let overlap_adjustment =
+        gtk::Adjustment::new(current.overlap, 0.0, 1.0, 0.05, 0.1, 0.1);
+    let overlap = gtk::SpinButton::new(Some(&overlap_adjustment), 0.01, 2);
+    let dimension_adjustment =
+        gtk::Adjustment::new(current.dimension, 0.0, 1.0, 0.05, 0.1, 0.1);
+    let dimension = gtk::SpinButton::new(Some(&dimension_adjustment), 0.01, 2);
+
+    panel.append(&labelled(
+        "Boxes must overlap by",
+        &overlap,
+        "How much two boxes have to overlap to count as the same place.",
+    ));
+    panel.append(&labelled(
+        "Boxes must match in size by",
+        &dimension,
+        "How alike two boxes have to be in size to count as the same place.",
+    ));
+
+    let for_overlap = settings.clone();
+    overlap.connect_value_changed(move |spin| {
+        if let Ok(mut settings) = for_overlap.lock() {
+            settings.overlap = spin.value();
+        }
+    });
+
+    let for_dimension = settings.clone();
+    dimension.connect_value_changed(move |spin| {
+        if let Ok(mut settings) = for_dimension.lock() {
+            settings.dimension = spin.value();
+        }
+    });
+
+    panel
+}
+
+fn labelled(text: &str, control: &gtk::SpinButton, tooltip: &str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_tooltip_text(Some(tooltip));
+    row.append(&label);
+    row.append(control);
+    row
+}
+
 fn pill(label: &str, style: Option<&str>) -> gtk::Button {
     let button = gtk::Button::with_label(label);
     button.add_css_class("pill");
@@ -887,6 +969,27 @@ mod tests {
         let offset = (35.0f64, -15.0f64);
         let (x, y) = (start.0 + offset.0, start.1 + offset.1);
         assert_eq!((x, y), (155.0, 225.0));
+    }
+
+    /// A crop dragged past the edge of the frame used to make the bounds
+    /// for clamping turn inside out, which panicked.
+    #[test]
+    fn a_crop_bigger_than_the_frame_is_shrunk_instead_of_panicking() {
+        let preview = Preview::new();
+        preview.rect.set(Some((65.55555555555554, 10.0, 100.0, 50.0)));
+
+        let mut crop = Crop {
+            x: 70.0,
+            y: 10.0,
+            width: 200.0,
+            height: 80.0,
+        };
+        preview.clamp(&mut crop);
+
+        assert!(crop.width <= 100.0, "the crop must fit the frame");
+        assert!(crop.height <= 50.0, "the crop must fit the frame");
+        assert!(crop.x >= 65.55555555555554);
+        assert!(crop.y >= 10.0);
     }
 
     /// The corner of the crop is the point the pointer went down on, with no

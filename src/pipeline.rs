@@ -65,6 +65,7 @@ impl Pipeline {
         japanese_only: bool,
         restore_token: Arc<Mutex<Option<String>>>,
         region: Arc<Mutex<Option<crate::region::Region>>>,
+        settings: Arc<Mutex<crate::dedupe::Settings>>,
     ) -> Self {
         let (commands, inbox) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -80,6 +81,7 @@ impl Pipeline {
                     japanese_only,
                     restore_token,
                     region,
+                    settings,
                 )
             })
             .expect("spawn pipeline thread");
@@ -121,6 +123,7 @@ fn run(
     japanese_only: bool,
     restore_token: Arc<Mutex<Option<String>>>,
     region: Arc<Mutex<Option<crate::region::Region>>>,
+    settings: Arc<Mutex<crate::dedupe::Settings>>,
 ) {
     guarded(&events, || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -136,7 +139,7 @@ fn run(
 
         let mut capture: Option<Capture> = None;
         let mut engine: Option<Engine> = None;
-        let mut history = History::new();
+        let mut history = History::new(settings);
         let mut total: usize = 0;
         let mut recognising = false;
         let mut last_preview = std::time::Instant::now() - Duration::from_millis(700);

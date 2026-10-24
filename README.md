@@ -77,6 +77,9 @@ fraction of the frame, so it stays put when the captured window is resized.
 **Show where text was found** draws a box around every line the recogniser
 picked up, so you can see where the text on screen came from.
 
+**Settings** opens a panel with the two thresholds that decide whether two
+detections are in the same place, so they can be tuned while the app runs.
+
 ## What counts as new text
 
 Text that is still on screen gets recognised again on every frame, so it is
