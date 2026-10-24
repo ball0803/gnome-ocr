@@ -21,8 +21,30 @@ const APP_ID: &str = "dev.local.gnome_ocr";
 
 /// How close the pointer has to be to a handle to grab it.
 const HANDLE_GRAB: f64 = 10.0;
-/// The smallest crop the user can make, as a fraction of the frame.
-const MIN_CROP: f64 = 0.01;
+/// The smallest crop the user can make, in pixels.
+const MIN_CROP: f64 = 8.0;
+
+/// The crop rectangle, in the coordinates the preview is drawn in.
+///
+/// Keeping it in the same space as the pointer means the corner is under the
+/// mouse by construction: nothing has to be converted to draw it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Crop {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl Crop {
+    fn right(&self) -> f64 {
+        self.x + self.width
+    }
+
+    fn bottom(&self) -> f64 {
+        self.y + self.height
+    }
+}
 
 /// The eight handles of a crop rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,9 +65,9 @@ enum Drag {
     /// Dragging out a new rectangle, from the point it started at.
     New { anchor: (f64, f64) },
     /// Moving the whole rectangle.
-    Move { grab: (f64, f64), start: Region },
+    Move { grab: (f64, f64), start: Crop },
     /// Dragging one of the handles.
-    Resize { handle: Handle, start: Region },
+    Resize { handle: Handle, start: Crop },
 }
 
 /// What the preview shows and lets the user select.
@@ -54,7 +76,7 @@ struct Preview {
     /// The frame scaled to the size it is drawn at, so that moving the
     /// pointer does not rescale it again for every motion event.
     scaled: RefCell<Option<(cairo::ImageSurface, i32, i32)>>,
-    crop: RefCell<Option<Region>>,
+    crop: RefCell<Option<Crop>>,
     drag: RefCell<Option<Drag>>,
     /// Where the frame was last drawn, so pointer positions can be turned
     /// into a position in the frame.
@@ -119,22 +141,36 @@ impl Preview {
         ))
     }
 
-    /// A pointer position, as a fraction of the frame.
-    fn to_fraction(&self, x: f64, y: f64) -> Option<(f64, f64)> {
-        let rect = self.rect.get()?;
-        if rect.2 <= 0.0 || rect.3 <= 0.0 {
-            return None;
-        }
-        Some(to_fraction(rect, x, y))
-    }
-
     /// The crop rectangle, where it is drawn.
     fn crop_rect(&self) -> Option<(f64, f64, f64, f64)> {
         let crop = *self.crop.borrow();
         let crop = crop?;
-        let rect = self.rect.get()?;
-        let (left, top) = to_drawn(rect, crop.x, crop.y);
-        Some((left, top, crop.width * rect.2, crop.height * rect.3))
+        Some((crop.x, crop.y, crop.width, crop.height))
+    }
+
+    /// Keeps the crop inside the frame that is drawn.
+    fn clamp(&self, crop: &mut Crop) {
+        let Some((left, top, width, height)) = self.rect.get() else {
+            return;
+        };
+        crop.x = crop.x.clamp(left, left + width - crop.width);
+        crop.y = crop.y.clamp(top, top + height - crop.height);
+    }
+
+    /// The crop as a fraction of the frame, for the recogniser.
+    fn crop_region(&self) -> Option<Region> {
+        let crop = *self.crop.borrow();
+        let crop = crop?;
+        let (left, top, width, height) = self.rect.get()?;
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        Some(Region {
+            x: (crop.x - left) / width,
+            y: (crop.y - top) / height,
+            width: crop.width / width,
+            height: crop.height / height,
+        })
     }
 
     /// The handle under the pointer, if any.
@@ -174,11 +210,11 @@ impl Preview {
 
 /// Moves one edge or corner of the rectangle, keeping the opposite edges
 /// where they were.
-fn resize(region: &mut Region, handle: Handle, x: f64, y: f64) {
-    let mut left = region.x;
-    let mut top = region.y;
-    let mut right = region.x + region.width;
-    let mut bottom = region.y + region.height;
+fn resize(crop: &mut Crop, handle: Handle, x: f64, y: f64) {
+    let mut left = crop.x;
+    let mut top = crop.y;
+    let mut right = crop.right();
+    let mut bottom = crop.bottom();
 
     match handle {
         Handle::NorthWest => {
@@ -203,24 +239,10 @@ fn resize(region: &mut Region, handle: Handle, x: f64, y: f64) {
         Handle::West => left = x.min(right - MIN_CROP),
     }
 
-    region.x = left;
-    region.y = top;
-    region.width = right - left;
-    region.height = bottom - top;
-}
-
-/// Turns a pointer position into a fraction of the frame.
-fn to_fraction(rect: (f64, f64, f64, f64), x: f64, y: f64) -> (f64, f64) {
-    let (left, top, width, height) = rect;
-    (
-        ((x - left) / width).clamp(0.0, 1.0),
-        ((y - top) / height).clamp(0.0, 1.0),
-    )
-}
-
-/// Turns a fraction of the frame into where it is drawn.
-fn to_drawn(rect: (f64, f64, f64, f64), x: f64, y: f64) -> (f64, f64) {
-    (rect.0 + x * rect.2, rect.1 + y * rect.3)
+    crop.x = left;
+    crop.y = top;
+    crop.width = right - left;
+    crop.height = bottom - top;
 }
 
 pub fn run(japanese_only: bool) -> glib::ExitCode {
@@ -494,20 +516,17 @@ impl Window {
 
         let begin = Rc::clone(&self.preview);
         drag.connect_drag_begin(move |_gesture, x, y| {
-            let Some(fraction) = begin.to_fraction(x, y) else {
-                return;
-            };
             if let Some(handle) = begin.handle_at(x, y) {
                 let start = begin.crop.borrow().unwrap_or_default();
                 *begin.drag.borrow_mut() = Some(Drag::Resize { handle, start });
             } else if begin.inside_crop(x, y) {
                 let start = begin.crop.borrow().unwrap_or_default();
                 *begin.drag.borrow_mut() = Some(Drag::Move {
-                    grab: fraction,
+                    grab: (x, y),
                     start,
                 });
             } else {
-                *begin.drag.borrow_mut() = Some(Drag::New { anchor: fraction });
+                *begin.drag.borrow_mut() = Some(Drag::New { anchor: (x, y) });
                 *begin.crop.borrow_mut() = None;
             }
         });
@@ -515,25 +534,28 @@ impl Window {
         let update = Rc::clone(&self.preview);
         let owner = Rc::clone(self);
         drag.connect_drag_update(move |_gesture, x, y| {
-            let Some(fraction) = update.to_fraction(x, y) else {
-                return;
-            };
             let current = update.drag.borrow().clone();
             match current {
                 Some(Drag::New { anchor }) => {
-                    let region = Region::from_corners(anchor, fraction);
-                    *update.crop.borrow_mut() = Some(region);
+                    *update.crop.borrow_mut() = Some(Crop {
+                        x: anchor.0.min(x),
+                        y: anchor.1.min(y),
+                        width: (x - anchor.0).abs(),
+                        height: (y - anchor.1).abs(),
+                    });
                 }
                 Some(Drag::Move { grab, start }) => {
-                    let mut region = start;
-                    region.x = (region.x + fraction.0 - grab.0).clamp(0.0, 1.0 - region.width);
-                    region.y = (region.y + fraction.1 - grab.1).clamp(0.0, 1.0 - region.height);
-                    *update.crop.borrow_mut() = Some(region);
+                    let mut crop = start;
+                    crop.x += x - grab.0;
+                    crop.y += y - grab.1;
+                    update.clamp(&mut crop);
+                    *update.crop.borrow_mut() = Some(crop);
                 }
                 Some(Drag::Resize { handle, start }) => {
-                    let mut region = start;
-                    resize(&mut region, handle, fraction.0, fraction.1);
-                    *update.crop.borrow_mut() = Some(region);
+                    let mut crop = start;
+                    resize(&mut crop, handle, x, y);
+                    update.clamp(&mut crop);
+                    *update.crop.borrow_mut() = Some(crop);
                 }
                 None => {}
             }
@@ -554,8 +576,7 @@ impl Window {
 
     /// Shows what the current crop covers, without changing it.
     fn update_area_label(&self) {
-        let crop = *self.preview.crop.borrow();
-        match crop.filter(|crop| !crop.is_empty()) {
+        match self.preview.crop_region() {
             Some(region) => {
                 self.area_label.set_text(&format!(
                     "Area: {}x{} at {},{}",
@@ -571,8 +592,10 @@ impl Window {
 
     /// Sends the current crop to the recogniser and updates the label.
     fn publish_region(self: &Rc<Self>) {
-        let crop = *self.preview.crop.borrow();
-        let usable = crop.filter(|crop| !crop.is_empty());
+        let usable = self
+            .preview
+            .crop_region()
+            .filter(|region| !region.is_empty());
 
         if let Ok(mut shared) = self.region.lock() {
             *shared = usable;
@@ -760,8 +783,8 @@ fn pill(label: &str, style: Option<&str>) -> gtk::Button {
 mod tests {
     use super::*;
 
-    fn region(x: f64, y: f64, width: f64, height: f64) -> Region {
-        Region {
+    fn crop(x: f64, y: f64, width: f64, height: f64) -> Crop {
+        Crop {
             x,
             y,
             width,
@@ -769,66 +792,68 @@ mod tests {
         }
     }
 
+    /// The corner of the crop is the point the pointer went down on, with no
+    /// conversion in between.
     #[test]
-    fn a_pointer_position_becomes_a_fraction_of_the_frame() {
-        // The frame is drawn at 800x400 starting at 100,50.
-        let rect = (100.0, 50.0, 800.0, 400.0);
-        let (x, y) = to_fraction(rect, 500.0, 250.0);
-        assert!((x - 0.5).abs() < 1e-9);
-        assert!((y - 0.5).abs() < 1e-9);
+    fn a_crop_corner_is_the_point_the_pointer_went_down_on() {
+        let anchor = (123.0f64, 456.0f64);
+        let released = (321.0f64, 654.0f64);
+        let crop = Crop {
+            x: anchor.0.min(released.0),
+            y: anchor.1.min(released.1),
+            width: (released.0 - anchor.0).abs(),
+            height: (released.1 - anchor.1).abs(),
+        };
+        assert_eq!((crop.x, crop.y), (123.0, 456.0));
+        assert_eq!((crop.right(), crop.bottom()), (321.0, 654.0));
     }
 
+    /// The crop can be dragged the other way too.
     #[test]
-    fn a_pointer_outside_the_frame_is_clamped_to_it() {
-        let rect = (100.0, 50.0, 800.0, 400.0);
-        let (x, y) = to_fraction(rect, 0.0, 0.0);
-        assert_eq!(x, 0.0);
-        assert_eq!(y, 0.0);
-        let (x, y) = to_fraction(rect, 10_000.0, 10_000.0);
-        assert_eq!(x, 1.0);
-        assert_eq!(y, 1.0);
-    }
-
-    #[test]
-    fn a_fraction_maps_back_to_where_it_is_drawn() {
-        let rect = (100.0, 50.0, 800.0, 400.0);
-        let (x, y) = to_drawn(rect, 0.25, 0.75);
-        assert!((x - 300.0).abs() < 1e-9);
-        assert!((y - 350.0).abs() < 1e-9);
+    fn a_crop_drawn_up_and_to_the_left_still_starts_at_the_pointer() {
+        let anchor = (321.0f64, 654.0f64);
+        let released = (123.0f64, 456.0f64);
+        let crop = Crop {
+            x: anchor.0.min(released.0),
+            y: anchor.1.min(released.1),
+            width: (released.0 - anchor.0).abs(),
+            height: (released.1 - anchor.1).abs(),
+        };
+        assert_eq!((crop.x, crop.y), (123.0, 456.0));
     }
 
     #[test]
     fn a_corner_handle_moves_two_edges_and_leaves_the_others() {
-        let mut crop = region(0.2, 0.2, 0.4, 0.4);
-        resize(&mut crop, Handle::NorthWest, 0.1, 0.15);
-        assert!((crop.x - 0.1).abs() < 1e-9);
-        assert!((crop.y - 0.15).abs() < 1e-9);
-        assert!((crop.width - 0.5).abs() < 1e-9);
-        assert!((crop.height - 0.45).abs() < 1e-9);
+        let mut crop = crop(200.0, 200.0, 400.0, 400.0);
+        resize(&mut crop, Handle::NorthWest, 100.0, 150.0);
+        assert_eq!(crop.x, 100.0);
+        assert_eq!(crop.y, 150.0);
+        assert_eq!(crop.right(), 600.0);
+        assert_eq!(crop.bottom(), 600.0);
     }
 
     #[test]
     fn an_edge_handle_moves_only_that_edge() {
-        let mut crop = region(0.2, 0.2, 0.4, 0.4);
-        resize(&mut crop, Handle::East, 0.8, 0.0);
-        assert!((crop.x - 0.2).abs() < 1e-9);
-        assert!((crop.y - 0.2).abs() < 1e-9);
-        assert!((crop.width - 0.6).abs() < 1e-9);
-        assert!((crop.height - 0.4).abs() < 1e-9);
+        let mut crop = crop(200.0, 200.0, 400.0, 400.0);
+        resize(&mut crop, Handle::East, 800.0, 0.0);
+        assert_eq!(crop.x, 200.0);
+        assert_eq!(crop.y, 200.0);
+        assert_eq!(crop.right(), 800.0);
+        assert_eq!(crop.bottom(), 600.0);
     }
 
     #[test]
     fn a_crop_cannot_be_squeezed_out_of_existence() {
-        let mut crop = region(0.2, 0.2, 0.4, 0.4);
-        resize(&mut crop, Handle::NorthWest, 0.9, 0.9);
+        let mut crop = crop(200.0, 200.0, 400.0, 400.0);
+        resize(&mut crop, Handle::NorthWest, 900.0, 900.0);
         assert!(crop.width >= MIN_CROP);
         assert!(crop.height >= MIN_CROP);
     }
 
     #[test]
     fn a_crop_cannot_be_pushed_past_the_other_edge() {
-        let mut crop = region(0.2, 0.2, 0.4, 0.4);
-        resize(&mut crop, Handle::West, 0.9, 0.2);
-        assert!((crop.x + crop.width - 0.6).abs() < 1e-9);
+        let mut crop = crop(200.0, 200.0, 400.0, 400.0);
+        resize(&mut crop, Handle::West, 900.0, 200.0);
+        assert_eq!(crop.right(), 600.0);
     }
 }
