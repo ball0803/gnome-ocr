@@ -160,15 +160,9 @@ fn run_pipewire(
                 }
                 Err(err) => tracing::info!("  parse_format failed: {err:?}"),
             }
-            match info_format.lock().expect("format lock").parse(param) {
-                Ok(_) => {
-                    let g = info_format.lock().expect("format lock");
-                    tracing::info!(
-                        "  negotiated {}x{} as {:?}",
-                        g.size().width,
-                        g.size().height,
-                        g.format()
-                    );
+            match apply_negotiated_format(&info_format, param) {
+                Ok((width, height, format)) => {
+                    tracing::info!("  negotiated {width}x{height} as {format:?}");
                 }
                 Err(err) => tracing::error!("  VideoInfoRaw parse failed: {err:?}"),
             }
@@ -316,11 +310,24 @@ fn run_pipewire(
         .context("connect stream")?;
     tracing::info!("pipewire connected; entering mainloop");
 
-
     mainloop.run();
     tracing::info!("pipewire mainloop exited");
     Ok(())
 }
+/// Applies a negotiated format pod and reports the geometry it carries.
+///
+/// The lock is taken once and held across both the parse and the read.
+/// Taking a second lock here deadlocks: the mutex is not reentrant and this
+/// runs on the PipeWire mainloop thread, so the whole stream stops.
+fn apply_negotiated_format(
+    info: &Mutex<VideoInfoRaw>,
+    param: &spa::pod::Pod,
+) -> Result<(u32, u32, VideoFormat), spa::utils::result::Error> {
+    let mut guard = info.lock().expect("format lock");
+    guard.parse(param)?;
+    Ok((guard.size().width, guard.size().height, guard.format()))
+}
+
 /// Bytes per pixel for a negotiated format, or None if it cannot be read.
 fn pixel_size(format: VideoFormat) -> Option<usize> {
     match format {
@@ -340,6 +347,56 @@ mod tests {
     use pw::spa::param::format::MediaSubtype;
     use pw::spa::param::format::MediaType;
     use pw::spa::param::video::VideoFormat;
+
+    /// A second lock on the same mutex would wedge the PipeWire mainloop
+    /// thread forever. The work runs on a helper thread with a deadline so
+    /// a regression fails the test instead of hanging the suite.
+    #[test]
+    fn applying_a_negotiated_format_completes_without_deadlocking() {
+        let object = pw::spa::pod::object!(
+            pw::spa::utils::SpaTypes::ObjectParamFormat,
+            pw::spa::param::ParamType::Format,
+            pw::spa::pod::property!(
+                FormatProperties::MediaType,
+                Id, MediaType::Video),
+            pw::spa::pod::property!(
+                FormatProperties::MediaSubtype,
+                Id, MediaSubtype::Raw),
+            pw::spa::pod::property!(
+                FormatProperties::VideoFormat,
+                Id, VideoFormat::BGRx),
+            pw::spa::pod::property!(
+                FormatProperties::VideoSize,
+                Rectangle, pw::spa::utils::Rectangle { width: 1920, height: 1080 }),
+        );
+        let bytes = pw::spa::pod::serialize::PodSerializer::serialize(
+            std::io::Cursor::new(Vec::new()),
+            &pw::spa::pod::Value::Object(object),
+        )
+        .expect("serialize")
+        .0
+        .into_inner();
+        let bytes = std::sync::Arc::new(bytes);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = bytes.clone();
+        std::thread::spawn(move || {
+            let pod = pw::spa::pod::Pod::from_bytes(&worker).expect("pod");
+            let info = std::sync::Mutex::new(VideoInfoRaw::new());
+            let result = apply_negotiated_format(&info, pod);
+            let _ = tx.send(result.map(|(w, h, f)| (w, h, f)));
+        });
+
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let (width, height, format) = match outcome {
+            Ok(Ok(value)) => value,
+            Ok(Err(err)) => panic!("applying the format failed: {err:?}"),
+            Err(err) => panic!("applying the format deadlocked: {err}"),
+        };
+        assert_eq!(width, 1920);
+        assert_eq!(height, 1080);
+        assert_eq!(format, VideoFormat::BGRx);
+    }
 
     /// The gate that used to discard the negotiated format: parse_format has
     /// to accept it, and VideoInfoRaw::parse has to yield the geometry.
