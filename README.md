@@ -63,11 +63,16 @@ a new capture.
 portal asks again which screen or window to use, instead of restoring the
 previous choice.
 
-The preview shows what is being captured, along with the kind of source and
-its size. Drag across the preview to recognise only that part of the frame;
-the rest of the screen is ignored. The selection is kept as a fraction of the
-frame, so it stays put when the captured window is resized. **Whole capture**
-goes back to recognising everything.
+The preview shows what is being captured, at the size it was captured, along
+with the kind of source and its size. It carries a crop rectangle:
+
+- drag on the preview to draw one
+- drag a handle, corner or edge, to resize it
+- drag inside it to move it
+
+Only the cropped part of the frame is recognised. The crop is kept as a
+fraction of the frame, so it stays put when the captured window is resized.
+**Whole capture** goes back to recognising everything.
 
 Toggle **Auto-copy new text** to control whether new lines are copied to your
 clipboard; **Copy all** copies everything shown; **Clear** empties the view
