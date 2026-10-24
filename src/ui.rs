@@ -12,7 +12,6 @@ use gtk::gdk::prelude::*;
 use gtk::prelude::*;
 use gtk::{gio, glib};
 
-use crate::capture::SourceKind;
 use crate::pipeline::{Event, Pipeline};
 
 const APP_ID: &str = "dev.local.gnome_ocr";
@@ -39,7 +38,6 @@ struct Window {
     copy_button: gtk::Button,
     clear_button: gtk::Button,
     auto_copy: gtk::Switch,
-    source_kind: gtk::DropDown,
     status: gtk::Label,
     events: async_channel::Sender<Event>,
     pipeline: RefCell<Option<Pipeline>>,
@@ -67,12 +65,6 @@ impl Window {
             .active(true)
             .build();
 
-        let source_kind = gtk::DropDown::from_strings(&["Screen", "Window"]);
-        source_kind.set_selected(0);
-        source_kind.set_valign(gtk::Align::Center);
-        source_kind.set_tooltip_text(Some(
-            "What to capture. You pick the exact screen or window in the dialog that opens.",
-        ));
 
         let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         toolbar.set_margin_top(12);
@@ -81,10 +73,6 @@ impl Window {
         toolbar.set_margin_end(12);
         toolbar.append(&start_button);
         toolbar.append(&stop_button);
-        toolbar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        toolbar.append(&gtk::Label::new(Some("Capture")));
-        toolbar.append(&source_kind);
-        toolbar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         toolbar.append(&gtk::Label::new(Some("Auto-copy new text")));
         toolbar.append(&auto_copy);
         toolbar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
@@ -137,7 +125,6 @@ impl Window {
             copy_button,
             clear_button,
             auto_copy,
-            source_kind,
             status,
             events,
             pipeline: RefCell::new(None),
@@ -198,19 +185,10 @@ impl Window {
         self.clear();
         self.start_button.set_sensitive(false);
         self.stop_button.set_sensitive(true);
-        self.source_kind.set_sensitive(false);
 
-        let source = if self.source_kind.selected() == 1 {
-            SourceKind::Window
-        } else {
-            SourceKind::Screen
-        };
-        self.set_status(match source {
-            SourceKind::Window => "Pick a window in the dialog that opens…",
-            SourceKind::Screen => "Pick a screen in the dialog that opens…",
-        });
+        self.set_status("Pick a screen or window in the dialog that opens…");
 
-        let pipeline = Pipeline::start(self.events.clone(), self.japanese_only, source);
+        let pipeline = Pipeline::start(self.events.clone(), self.japanese_only);
         *self.pipeline.borrow_mut() = Some(pipeline);
     }
 
@@ -233,13 +211,11 @@ impl Window {
                 self.set_status(&format!("Problem: {err}"));
                 self.start_button.set_sensitive(true);
                 self.stop_button.set_sensitive(false);
-                self.source_kind.set_sensitive(true);
             }
             Event::Stopped => {
                 *self.pipeline.borrow_mut() = None;
                 self.start_button.set_sensitive(true);
                 self.stop_button.set_sensitive(false);
-                self.source_kind.set_sensitive(true);
             }
         }
     }

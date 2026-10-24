@@ -16,10 +16,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use ashpd::desktop::PersistMode;
-use ashpd::enumflags2::BitFlags;
 use pipewire as pw;
 use pw::{main_loop::MainLoopRc, properties::properties, spa};
-use spa::param::video::VideoInfoRaw;
+use spa::param::video::{VideoFormat, VideoInfoRaw};
 use std::sync::mpsc::SyncSender;
 
 /// A single captured frame as RGBA8, ready to be encoded as PNG.
@@ -51,30 +50,13 @@ impl Drop for Session {
     }
 }
 
-/// What the portal should offer as a capture target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceKind {
-    /// A whole monitor.
-    Screen,
-    /// A single application window, chosen in the portal dialog.
-    Window,
-}
-
-impl SourceKind {
-    fn source_type(self) -> SourceType {
-        match self {
-            SourceKind::Screen => SourceType::Monitor,
-            SourceKind::Window => SourceType::Window,
-        }
-    }
-}
-
 /// Request a ScreenCast session and begin pumping frames into `tx`.
 ///
 /// The portal shows a permission dialog once per session; the user must accept
-/// it, and pick which screen or window to share. Returns after the portal
+/// it and pick which screen or window to share. Both kinds are requested, so
+/// the dialog lists screens and windows alike. Returns after the portal
 /// handshake, before any frame has arrived.
-pub async fn start(tx: SyncSender<Frame>, source: SourceKind) -> Result<Session> {
+pub async fn start(tx: SyncSender<Frame>) -> Result<Session> {
     let proxy = Screencast::new().await?;
     let session = proxy.create_session(Default::default()).await?;
     proxy
@@ -82,7 +64,7 @@ pub async fn start(tx: SyncSender<Frame>, source: SourceKind) -> Result<Session>
             &session,
             SelectSourcesOptions::default()
                 .set_cursor_mode(CursorMode::Hidden)
-                .set_sources(BitFlags::from(source.source_type()))
+                .set_sources(SourceType::Monitor | SourceType::Window)
                 .set_multiple(false)
                 .set_persist_mode(PersistMode::DoNot),
         )
@@ -97,9 +79,11 @@ pub async fn start(tx: SyncSender<Frame>, source: SourceKind) -> Result<Session>
         .context("portal returned no streams")?
         .to_owned();
     tracing::info!(
-        "portal granted: node_id={} size={:?}",
+        "portal v{} granted: node_id={} size={:?} position={:?}",
+        proxy.version(),
         stream.pipe_wire_node_id(),
-        stream.size()
+        stream.size(),
+        stream.position()
     );
     let node_id: u32 = stream.pipe_wire_node_id();
     let fd: OwnedFd = proxy
@@ -164,6 +148,7 @@ fn run_pipewire(
         .param_changed(move |_, _, id, param| {
             let Some(param) = param else { return };
             if id != spa::param::ParamType::Format.as_raw() {
+                tracing::info!("pipewire param {id} changed (not a format)");
                 return;
             }
             let Ok((media, sub)) = pw::spa::param::format_utils::parse_format(param) else {
@@ -200,34 +185,63 @@ fn run_pipewire(
             let Some(datas) = buffer.datas_mut().first_mut() else {
                 return;
             };
-            let stride = datas.chunk().stride().unsigned_abs() as usize;
-            let (width, height, bgr_order) = {
+            let (width, height, format) = {
                 let g = info_size.lock().expect("info lock");
-                let bgr = is_bgr_order(g.format());
-                (g.size().width, g.size().height, bgr)
+                (g.size().width, g.size().height, g.format())
             };
             if width == 0 || height == 0 {
                 return;
             }
+            let Some(pixel_size) = pixel_size(format) else {
+                tracing::warn!("unsupported negotiated format {format:?}");
+                return;
+            };
+
+            let chunk = datas.chunk();
+            let offset = chunk.offset() as usize;
+            let chunk_size = chunk.size() as usize;
+            let raw_stride = chunk.stride();
             let Some(source) = datas.data() else { return };
 
-            let row_bytes = (width as usize * 4).min(stride);
-            let row_len = width as usize * 4;
-            let mut rgba = vec![0u8; row_len * height as usize];
-            for (row, chunk) in rgba.chunks_mut(row_len).enumerate() {
-                let src_offset = row * stride;
-                let available = source.len().saturating_sub(src_offset);
-                let copy = row_bytes.min(available).min(chunk.len());
-                if copy == 0 {
+            // PipeWire occasionally leaves the stride at zero when the
+            // producer did not fill it in.
+            let stride = if raw_stride > 0 {
+                raw_stride as usize
+            } else {
+                width as usize * pixel_size
+            };
+            let row_bytes = width as usize * pixel_size;
+            let end = offset.saturating_add(chunk_size).min(source.len());
+            let Some(source) = source.get(offset..end) else {
+                return;
+            };
+            if source.len() < stride.saturating_mul(height as usize) {
+                return;
+            }
+
+            let mut rgba = vec![0u8; width as usize * height as usize * 4];
+            for y in 0..height as usize {
+                let row_start = y * stride;
+                if row_start + row_bytes > source.len() {
                     break;
                 }
-                chunk[..copy].copy_from_slice(&source[src_offset..src_offset + copy]);
-            }
-            // Only BGR-ordered formats need the red/blue swap. Swapping on an
-            // already-RGB frame would hand OCR a colour-inverted image.
-            if bgr_order {
-                for [r, _g, b, _] in rgba.as_chunks_mut::<4>().0 {
-                    std::mem::swap(r, b);
+                let row = &source[row_start..row_start + row_bytes];
+                for x in 0..width as usize {
+                    let input = &row[x * pixel_size..];
+                    let output = &mut rgba[(y * width as usize + x) * 4..];
+                    let alpha = if pixel_size == 4 {
+                        input[3]
+                    } else {
+                        0xFF
+                    };
+                    match format {
+                        VideoFormat::RGB | VideoFormat::RGBA | VideoFormat::RGBx => {
+                            output.copy_from_slice(&[input[0], input[1], input[2], alpha]);
+                        }
+                        _ => {
+                            output.copy_from_slice(&[input[2], input[1], input[0], alpha]);
+                        }
+                    }
                 }
             }
 
@@ -258,22 +272,22 @@ fn run_pipewire(
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoFormat,
             Choice, Enum, Id,
-            pw::spa::param::video::VideoFormat::RGB,
-            pw::spa::param::video::VideoFormat::RGB,
-            pw::spa::param::video::VideoFormat::RGBA,
-            pw::spa::param::video::VideoFormat::RGBx,
             pw::spa::param::video::VideoFormat::BGRx,
+            pw::spa::param::video::VideoFormat::BGRx,
+            pw::spa::param::video::VideoFormat::BGRA,
+            pw::spa::param::video::VideoFormat::RGBx,
+            pw::spa::param::video::VideoFormat::RGBA,
         ),
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoSize,
             Choice, Range, Rectangle,
             pw::spa::utils::Rectangle { width: 1920, height: 1080 },
             pw::spa::utils::Rectangle { width: 1, height: 1 },
-            pw::spa::utils::Rectangle { width: 4096, height: 4096 }),
+            pw::spa::utils::Rectangle { width: 7680, height: 4320 }),
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoFramerate,
             Choice, Range, Fraction,
-            pw::spa::utils::Fraction { num: 25, denom: 1 },
+            pw::spa::utils::Fraction { num: 30, denom: 1 },
             pw::spa::utils::Fraction { num: 0,  denom: 1 },
             pw::spa::utils::Fraction { num: 1000, denom: 1 }),
     );
@@ -296,20 +310,19 @@ fn run_pipewire(
         .context("connect stream")?;
     tracing::info!("pipewire connected; entering mainloop");
 
-    // Without this the stream sits in Paused forever and never negotiates a
-    // format, so no buffers are ever delivered.
-    stream.set_active(true).context("activate stream")?;
-    tracing::info!("stream activated");
 
     mainloop.run();
     tracing::info!("pipewire mainloop exited");
     Ok(())
 }
-/// True when the negotiated format stores bytes as blue, green, red.
-fn is_bgr_order(format: pw::spa::param::video::VideoFormat) -> bool {
-    use pw::spa::param::video::VideoFormat as F;
-    matches!(
-        format,
-        F::BGR | F::BGRx | F::BGRA | F::ARGB | F::xBGR | F::ABGR
-    )
+/// Bytes per pixel for a negotiated format, or None if it cannot be read.
+fn pixel_size(format: VideoFormat) -> Option<usize> {
+    match format {
+        VideoFormat::RGB | VideoFormat::BGR => Some(3),
+        VideoFormat::RGBA
+        | VideoFormat::RGBx
+        | VideoFormat::BGRA
+        | VideoFormat::BGRx => Some(4),
+        _ => None,
+    }
 }

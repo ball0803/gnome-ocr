@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::Context;
 use async_channel::Sender;
 
-use crate::capture::{self, Frame, SourceKind};
+use crate::capture::{self, Frame};
 use crate::engine::Engine;
 
 /// One update for the UI.
@@ -33,13 +33,13 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Start capturing and OCRing in the background.
-    pub fn start(events: Sender<Event>, japanese_only: bool, source: SourceKind) -> Self {
+    pub fn start(events: Sender<Event>, japanese_only: bool) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
 
         std::thread::Builder::new()
             .name("gnome-ocr-pipeline".into())
-            .spawn(move || run(events, thread_shutdown, japanese_only, source))
+            .spawn(move || run(events, thread_shutdown, japanese_only))
             .expect("spawn pipeline thread");
 
         Self { shutdown }
@@ -51,13 +51,8 @@ impl Pipeline {
     }
 }
 
-fn run(
-    events: Sender<Event>,
-    shutdown: Arc<AtomicBool>,
-    japanese_only: bool,
-    source: SourceKind,
-) {
-    if let Err(err) = execute(&events, &shutdown, japanese_only, source) {
+fn run(events: Sender<Event>, shutdown: Arc<AtomicBool>, japanese_only: bool) {
+    if let Err(err) = execute(&events, &shutdown, japanese_only) {
         emit(&events, Event::Failed(format!("{err}")));
     }
     emit(&events, Event::Stopped);
@@ -67,7 +62,6 @@ fn execute(
     events: &Sender<Event>,
     shutdown: &Arc<AtomicBool>,
     japanese_only: bool,
-    source: SourceKind,
 ) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -76,7 +70,7 @@ fn execute(
 
     let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(2);
     let session = runtime
-        .block_on(capture::start(frame_tx, source))
+        .block_on(capture::start(frame_tx))
         .context("start screen capture")?;
 
     let mut engine = Engine::spawn(japanese_only)?;

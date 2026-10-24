@@ -10,9 +10,9 @@ a small GTK4 window.
 ## What it does
 
 - Captures through the xdg-desktop-portal ScreenCast interface (PipeWire).
-  A **Capture** selector chooses *Screen* or *Window*; the portal dialog then
-  lets you pick exactly which screen or which application window to share.
-  You must approve the first capture.
+  Both screens and windows are offered, so the portal dialog lets you pick
+  exactly which screen or which application window to share. You must
+  approve the first capture.
 - Runs every captured frame through `qocrd`, which recognises Japanese by
   default.
 - Shows every newly recognised line in a scrollable text view.
@@ -48,19 +48,16 @@ The binary lands at `target/release/gnome-ocr`.
 ./target/release/gnome-ocr
 ```
 
-Choose **Screen** or **Window** in the **Capture** selector, then press
-**Start OCR** and approve the capture dialog. Recognised text starts filling
-the window. The selector is disabled while capture runs, since the target
-cannot change mid-stream.
+Press **Start OCR** and approve the capture dialog, then choose a screen or a
+window in it. Recognised text starts filling the window.
 
 Toggle **Auto-copy new text** to control whether new lines are copied to your
 clipboard; **Copy all** copies everything shown; **Clear** empties the view
 and resets the de-duplication set.
 
-Selecting **Window** restricts the stream to a single application window.
-Compositors decide how that window behaves when it is moved, resized, or
-minimised — some shrink the captured area to whatever is visible, so keep the
-window on screen while capturing.
+Compositors decide how a captured window behaves when it is moved, resized,
+or minimised — some shrink the captured area to whatever is visible, so keep
+the window on screen while capturing.
 
 By default the engine only reports Japanese text. To accept any language:
 
