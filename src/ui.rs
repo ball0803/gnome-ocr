@@ -314,14 +314,14 @@ impl ListEntry {
     /// Adds more text to the entry and shows the newest frame.
     fn append(&self, text: &str, image: Option<Vec<u8>>) {
         if !text.is_empty() {
-            for line in text.split('\n') {
-                let label = gtk::Label::new(Some(line));
-                label.set_xalign(0.0);
-                label.set_yalign(0.0);
-                label.set_wrap(true);
-                label.set_selectable(true);
-                self.content.append(&label);
-            }
+            // One label, so that the whole of it can be selected and copied
+            // in one go. A label keeps the line breaks it is given.
+            let label = gtk::Label::new(Some(text));
+            label.set_xalign(0.0);
+            label.set_yalign(0.0);
+            label.set_wrap(true);
+            label.set_selectable(true);
+            self.content.append(&label);
         }
         if let Some(png) = image
             && let Ok(texture) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(png))
