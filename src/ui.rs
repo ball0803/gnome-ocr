@@ -1355,6 +1355,38 @@ mod tests {
             "the picture should be back"
         );
 
+        // The window can be drawn, so that the layout can be looked at.
+        let height = window.root.default_height();
+        window.root.allocate(width, height, -1, None);
+
+        // Let the window be shown and drawn, so that it has something to
+        // draw with.
+        let context = glib::MainContext::default();
+        let _held = context.acquire();
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while std::time::Instant::now() < until {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let paintable = gtk::WidgetPaintable::new(Some(&window.root));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(&snapshot, f64::from(width), f64::from(height));
+
+        let node: gtk::gsk::RenderNode = unsafe {
+            let raw = gtk::ffi::gtk_snapshot_to_node(snapshot.as_ptr());
+            glib::translate::FromGlibPtrFull::from_glib_full(raw)
+        };
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)
+            .expect("a surface to draw on");
+        {
+            let context = cairo::Context::new(&surface).expect("a context to draw with");
+            node.draw(&context);
+        }
+        let mut file =
+            std::fs::File::create("/tmp/gnome-ocr-window.png").expect("a file to write to");
+        surface.write_to_png(&mut file).expect("the picture to be written");
+
         // The button stands in front of the choice of how the text is shown.
         let show_as = find_label(window.root.upcast_ref(), "Show as")
             .expect("the choice of how the text is shown should be there");
