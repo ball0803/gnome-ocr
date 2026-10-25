@@ -23,7 +23,7 @@ pub enum Event {
     /// Text that was recognised, and where it was found.
     Scanned {
         /// The blocks that had not been seen before, in reading order.
-        fresh: Vec<crate::layout::Block>,
+        fresh: Vec<crate::layout::Fresh>,
         /// How many new detections there have been in total.
         total: usize,
         /// A picture of the part of the frame the new text came from. It is
@@ -294,7 +294,7 @@ fn run(
                     let layout =
                         crate::layout::analyse(&scan.lines, current.clump, current.lists);
                     let mut fresh = Vec::new();
-                    for block in &layout.blocks {
+                    for (index, block) in layout.blocks.iter().enumerate() {
                         let detection = crate::dedupe::Detection {
                             text: block.text().to_owned(),
                             bounds: crate::dedupe::Box {
@@ -305,7 +305,10 @@ fn run(
                             },
                         };
                         if history.is_new(&detection) {
-                            fresh.push(block.clone());
+                            fresh.push(crate::layout::Fresh {
+                                block: block.clone(),
+                                new_paragraph: layout.starts_paragraph(index),
+                            });
                         }
                     }
                     total += fresh.len();

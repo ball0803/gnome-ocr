@@ -994,7 +994,7 @@ impl Window {
 
                 if !fresh.is_empty() {
                     // The blocks are already in reading order.
-                    let joined = crate::layout::join_blocks(&fresh, layout.block_gap);
+                    let joined = crate::layout::join_blocks(&fresh);
                     self.append(&format!("{joined}\n"));
                     if self.auto_copy.is_active() {
                         self.root.clipboard().set_text(&joined);
@@ -1038,15 +1038,11 @@ impl Window {
     fn add_list_entry(
         &self,
         image: Option<Vec<u8>>,
-        blocks: &[crate::layout::Block],
+        blocks: &[crate::layout::Fresh],
         section: Option<crate::layout::Heading>,
     ) {
         let source = self.source_id.borrow().clone();
-        let text = blocks
-            .iter()
-            .map(|block| block.text())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = crate::layout::join_blocks(blocks);
 
         // The same screen keeps one entry, and more text is added to it.
         if let Some(entry) = self.entries.borrow_mut().get_mut(&source) {
@@ -1241,10 +1237,11 @@ fn labelled(text: &str, control: &gtk::SpinButton, tooltip: &str) -> gtk::Box {
 /// The heading the given blocks sit under, if any.
 fn section_of(
     layout: &crate::layout::Layout,
-    blocks: &[crate::layout::Block],
+    blocks: &[crate::layout::Fresh],
 ) -> Option<crate::layout::Heading> {
     let sections = layout.sections();
-    for block in blocks {
+    for entry in blocks {
+        let block = &entry.block;
         for section in &sections {
             match block {
                 crate::layout::Block::Heading { text, .. } => {

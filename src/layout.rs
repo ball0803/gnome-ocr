@@ -343,6 +343,20 @@ pub enum Block {
     List { items: Vec<String>, bounds: Rect },
 }
 
+/// A block of text that had not been seen before.
+#[derive(Debug, Clone)]
+pub struct Fresh {
+    /// The block itself.
+    pub block: Block,
+    /// Whether the page has a large gap between this block and the block
+    /// before it, so that it starts a new paragraph.
+    ///
+    /// This is taken from the page and not worked out from the blocks that
+    /// happen to be new, because a block that was already shown still stands
+    /// between them.
+    pub new_paragraph: bool,
+}
+
 impl Block {
     /// The text of the block. The items of a list are shown together, since
     /// they are one unit of the page.
@@ -372,6 +386,19 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Whether the block at the given place starts a new paragraph.
+    ///
+    /// That is the case when the page has a large gap between it and the
+    /// block before it.
+    pub fn starts_paragraph(&self, index: usize) -> bool {
+        if index == 0 || index >= self.blocks.len() {
+            return false;
+        }
+        let previous = self.blocks[index - 1].bounds();
+        let current = self.blocks[index].bounds();
+        current.y - previous.bottom() > self.block_gap
+    }
+
     /// The blocks grouped under the heading that introduces them.
     pub fn sections(&self) -> Vec<Section> {
         let mut sections: Vec<Section> = Vec::new();
@@ -662,19 +689,16 @@ const IDEOGRAPHIC_SPACE: char = '\u{3000}';
 /// Where the page has a large gap between two blocks, the break is kept and
 /// the next block is set out with an ideographic space, which is how a
 /// paragraph is marked in Japanese.
-pub fn join_blocks(blocks: &[Block], block_gap: f64) -> String {
+pub fn join_blocks(blocks: &[Fresh]) -> String {
     let mut text = String::new();
-    let mut previous: Option<Rect> = None;
-    for block in blocks {
-        let bounds = block.bounds();
-        if let Some(previous) = previous {
+    for (index, entry) in blocks.iter().enumerate() {
+        if index > 0 {
             text.push('\n');
-            if bounds.y - previous.bottom() > block_gap {
+            if entry.new_paragraph {
                 text.push(IDEOGRAPHIC_SPACE);
             }
         }
-        text.push_str(&block.text());
-        previous = Some(bounds);
+        text.push_str(&entry.block.text());
     }
     text
 }
@@ -1257,7 +1281,13 @@ mod tests {
         second.block_id = 2;
 
         let layout = analyse(&[first, second], true, true);
-        let text = crate::layout::join_blocks(&layout.blocks, layout.block_gap);
+        let fresh = (0..layout.blocks.len())
+            .map(|index| crate::layout::Fresh {
+                block: layout.blocks[index].clone(),
+                new_paragraph: layout.starts_paragraph(index),
+            })
+            .collect::<Vec<_>>();
+        let text = crate::layout::join_blocks(&fresh);
         assert!(
             text.contains("\n\u{3000}"),
             "a large gap should leave an ideographic space, got {text:?}"
@@ -1266,6 +1296,48 @@ mod tests {
             text.as_bytes().contains(&0xE3u8),
             "the space must be the ideographic one, not a plain one: {text:?}"
         );
+    }
+
+    /// A block that was already shown still stands between two new ones, so
+    /// the break between them is the one the page has there, and not the
+    /// larger gap that spans across the block in between.
+    #[test]
+    fn a_block_that_was_already_shown_does_not_make_a_break() {
+        let blocks = vec![
+            Block::Paragraph {
+                text: "above".to_owned(),
+                bounds: Rect { x: 0.0, y: 100.0, width: 100.0, height: 20.0 },
+            },
+            Block::Paragraph {
+                text: "between".to_owned(),
+                bounds: Rect { x: 0.0, y: 200.0, width: 100.0, height: 200.0 },
+            },
+            Block::Paragraph {
+                text: "below".to_owned(),
+                bounds: Rect { x: 0.0, y: 420.0, width: 100.0, height: 20.0 },
+            },
+        ];
+        let layout = Layout { blocks, block_gap: 50.0 };
+
+        // The block in between was shown already, so only the other two are
+        // new.
+        let fresh = vec![
+            Fresh {
+                block: layout.blocks[0].clone(),
+                new_paragraph: layout.starts_paragraph(0),
+            },
+            Fresh {
+                block: layout.blocks[2].clone(),
+                new_paragraph: layout.starts_paragraph(2),
+            },
+        ];
+
+        let text = join_blocks(&fresh);
+        assert!(
+            !text.contains(IDEOGRAPHIC_SPACE),
+            "the gap spans across a block that was shown already, got {text:?}"
+        );
+        assert_eq!(text, "above\nbelow");
     }
 
     /// With the joining turned off, each line keeps its own line.
