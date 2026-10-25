@@ -932,10 +932,24 @@ fn group_by_geometry(
 
 /// Joins a group of lines into one paragraph.
 fn make_paragraph(lines: &[&Line], clump: bool) -> Paragraph {
+    // Whether the text is set with spaces between its words. The engine
+    // knows this from the words it found.
+    let spaced = lines.iter().any(|line| words_are_spaced(line));
+
     let mut text = String::new();
     for line in lines {
         if !text.is_empty() {
-            text.push(if clump { ' ' } else { '\n' });
+            if clump {
+                // The lines of a paragraph are put back together the way the
+                // page had them: with a space where the text has spaces
+                // between its words, and with nothing where it does not, as
+                // in Japanese.
+                if spaced {
+                    text.push(' ');
+                }
+            } else {
+                text.push('\n');
+            }
         }
         text.push_str(&line_text(line));
     }
@@ -946,6 +960,14 @@ fn make_paragraph(lines: &[&Line], clump: bool) -> Paragraph {
         height: 0.0,
     });
     Paragraph { text, bounds }
+}
+
+/// Whether the words of the line are set apart by spaces.
+///
+/// The engine says whether a space follows each word it found, so this is
+/// known rather than guessed from the gaps between the words.
+fn words_are_spaced(line: &Line) -> bool {
+    line.words.iter().any(|word| word.has_space_after)
 }
 
 /// The text of a line, put back together from its words.
@@ -1119,6 +1141,35 @@ mod tests {
             },
             has_space_after: true,
         }
+    }
+
+    /// A line of words that are set apart by spaces, as English is.
+    fn spaced_line(words: &[&str], x: f64, y: f64, width: f64, height: f64) -> Line {
+        let mut line = line(&words.join(" "), x, y, width, height);
+        line.words = words
+            .iter()
+            .enumerate()
+            .map(|(index, text)| Word {
+                text: (*text).to_owned(),
+                bounds: Rect {
+                    x,
+                    y,
+                    width: width / words.len() as f64,
+                    height,
+                },
+                has_space_after: index + 1 < words.len(),
+            })
+            .collect();
+        line
+    }
+
+    /// A line of words that are set together, as Japanese is.
+    fn tight_line(words: &[&str], x: f64, y: f64, width: f64, height: f64) -> Line {
+        let mut line = spaced_line(words, x, y, width, height);
+        for word in &mut line.words {
+            word.has_space_after = false;
+        }
+        line
     }
 
     fn line(text: &str, x: f64, y: f64, width: f64, height: f64) -> Line {
@@ -1311,9 +1362,15 @@ vec![
         );
 
         // The two lines of one wrapped sentence are one paragraph.
+        let paragraph = layout
+            .blocks
+            .iter()
+            .find(|block| block.text().contains("レシピの保存"))
+            .expect("the wrapped sentence should be a paragraph");
         assert!(
-            text.contains("レシピの保存、レシピの作成をおこ なうにはログインしてください"),
-            "the wrapped sentence should be one paragraph, got {text:?}"
+            paragraph.text().contains("なうにはログインしてください"),
+            "both lines of the wrapped sentence should be in one paragraph, got {:?}",
+            paragraph.text()
         );
 
         // The lists of the page are found: the menu, and the five columns of
@@ -1532,6 +1589,47 @@ vec![
 
         let layout = analyse(&lines, true, true);
         assert_eq!(texts(&layout.blocks), vec!["real text"]);
+    }
+
+    /// The lines of a Japanese paragraph are put back together with nothing
+    /// between them, because Japanese is written without spaces between its
+    /// words.
+    #[test]
+    fn the_lines_of_a_japanese_paragraph_are_joined_without_a_space() {
+        let first = tight_line(&["レシピの保存、レシピの作成をおこ"], 60.0, 100.0, 200.0, 20.0);
+        let second = tight_line(&["なうにはログインしてください"], 60.0, 130.0, 200.0, 20.0);
+
+        let layout = analyse(&[first, second], true, true);
+        let text = layout
+            .blocks
+            .iter()
+            .map(|block| block.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("レシピの保存、レシピの作成をおこなうにはログインしてください"),
+            "the sentence should be put back together, got {text:?}"
+        );
+    }
+
+    /// Where the text has spaces between its words, the lines of a paragraph
+    /// are put back together with a space between them.
+    #[test]
+    fn the_lines_of_a_spaced_paragraph_are_joined_with_a_space() {
+        let first = spaced_line(&["popular", "search"], 60.0, 100.0, 200.0, 20.0);
+        let second = spaced_line(&["and", "more"], 60.0, 130.0, 200.0, 20.0);
+
+        let layout = analyse(&[first, second], true, true);
+        let text = layout
+            .blocks
+            .iter()
+            .map(|block| block.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("popular search and more"),
+            "the words should be put back together, got {text:?}"
+        );
     }
 
     #[test]

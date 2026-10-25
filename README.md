@@ -132,6 +132,11 @@ document analysis literature does it:
   together. An entry that is indented further along is at a different level
   and starts a list of its own
 
+The lines of a paragraph are put back together the way the page had them.
+The recogniser says whether a space follows each word it found, so where the
+text is set with spaces between its words the lines are joined with a space,
+and where it is not, as in Japanese, nothing goes between them.
+
 Where the page has a large gap between two pieces of text, the break is kept
 and the next piece is set out with an ideographic space, which is how a
 paragraph is marked in Japanese.
