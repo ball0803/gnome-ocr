@@ -39,6 +39,9 @@
 //! which is a definition rather than a tolerance: the list detection work
 //! says a list is three or more records.
 
+/// The ideographic space, which is how a gap is marked in Japanese.
+const IDEOGRAPHIC_SPACE: &str = "\u{3000}";
+
 /// A rectangle in the pixels of the frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -207,18 +210,13 @@ fn otsu_threshold(values: &[f64]) -> Option<f64> {
 /// Finds the runs of blocks that are a list.
 ///
 /// The entries of a menu are separate blocks that share a left edge and sit
-/// an even distance apart, and the distance that sets a list apart from the
-/// rest of the page is larger. Which distance is larger is worked out from
-/// the gaps themselves, by splitting them into a lower and an upper group
-/// with Otsu's method, so no threshold is chosen by hand.
-fn detect_lists(
-    lines: &[&Line],
-    median_height: f64,
-    threshold: Option<f64>,
-) -> Vec<Vec<usize>> {
+/// an even distance apart. The evenness of the spacing is what makes them
+/// one list, and it is measured against the size of the text, so it holds
+/// whatever the page is scaled to.
+fn detect_lists(lines: &[&Line], median_height: f64) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for band in align_bands(lines, median_height) {
-        detect_runs(&band, lines, threshold, median_height, &mut groups);
+        detect_runs(&band, lines, median_height, &mut groups);
     }
     groups
 }
@@ -267,7 +265,6 @@ fn align_bands(lines: &[&Line], median_height: f64) -> Vec<Vec<usize>> {
 fn detect_runs(
     band: &[usize],
     lines: &[&Line],
-    threshold: Option<f64>,
     median_height: f64,
     groups: &mut Vec<Vec<usize>>,
 ) {
@@ -279,8 +276,6 @@ fn detect_runs(
             .partial_cmp(&lines[*b].bounds.y)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-
-    let threshold = threshold.unwrap_or(median_height);
 
     // Whether a line is an entry of its own. The engine's layout model knows
     // which lines are separate items and which are the wrapped lines of one
@@ -312,13 +307,6 @@ fn detect_runs(
             let now = line.bounds.y - previous.bounds.bottom();
             let was = previous.bounds.y - before.bounds.bottom();
             if (now - was).abs() > ITEM_GAP * median_height {
-                push_group(&mut run, groups);
-            }
-        }
-        // A break on the page ends the list as well.
-        if let Some(last) = run.last() {
-            let previous = lines[*last];
-            if line.bounds.y - previous.bounds.bottom() > threshold {
                 push_group(&mut run, groups);
             }
         }
@@ -401,10 +389,15 @@ pub struct Fresh {
 impl Block {
     /// The text of the block. The items of a list are shown together, since
     /// they are one unit of the page.
+    ///
+    /// The entries of a list are apart on the page, so the space that goes
+    /// between them is one of ours, and it is the ideographic space, which
+    /// is how a gap is marked in Japanese. The spaces that were on the page
+    /// are left as they were.
     pub fn text(&self) -> String {
         match self {
             Block::Heading { text, .. } | Block::Paragraph { text, .. } => text.clone(),
-            Block::List { items, .. } => items.join(" "),
+            Block::List { items, .. } => items.join(IDEOGRAPHIC_SPACE),
         }
     }
 
@@ -643,7 +636,7 @@ fn order_horizontal(
     // The runs of short, aligned lines are a list, such as the entries of a
     // menu, and are kept together as one block.
     let groups = if lists {
-        detect_lists(&sorted, median_height, threshold)
+        detect_lists(&sorted, median_height)
     } else {
         Vec::new()
     };
@@ -722,9 +715,6 @@ fn order_horizontal(
     (placed, threshold.unwrap_or(median_height))
 }
 
-/// The ideographic space, which is how a paragraph is marked in Japanese.
-const IDEOGRAPHIC_SPACE: char = '\u{3000}';
-
 /// Joins the blocks into text.
 ///
 /// Where the page has a large gap between two blocks, the break is kept and
@@ -736,7 +726,7 @@ pub fn join_blocks(blocks: &[Fresh]) -> String {
         if index > 0 {
             text.push('\n');
             if entry.new_paragraph {
-                text.push(IDEOGRAPHIC_SPACE);
+                text.push_str(IDEOGRAPHIC_SPACE);
             }
         }
         text.push_str(&entry.block.text());
@@ -1589,6 +1579,32 @@ vec![
 
         let layout = analyse(&lines, true, true);
         assert_eq!(texts(&layout.blocks), vec!["real text"]);
+    }
+
+    /// The entries of a list are apart on the page, so the space that goes
+    /// between them is one of ours, and it is the ideographic space.
+    #[test]
+    fn the_entries_of_a_list_are_separated_by_an_ideographic_space() {
+        let mut first = line("Q", 24.0, 75.0, 20.0, 16.0);
+        first.block_id = 1;
+        let mut second = line("A section", 27.0, 127.0, 188.0, 20.0);
+        second.block_id = 2;
+        let mut third = line("Another section", 24.0, 179.0, 208.0, 19.0);
+        third.block_id = 3;
+        let mut fourth = line("And another", 26.0, 229.0, 171.0, 24.0);
+        fourth.block_id = 4;
+
+        let layout = analyse(&[first, second, third, fourth], true, true);
+        let text = layout
+            .blocks
+            .iter()
+            .map(|block| block.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Q\u{3000}A section\u{3000}Another section\u{3000}And another"),
+            "the entries should be separated by an ideographic space, got {text:?}"
+        );
     }
 
     /// The lines of a Japanese paragraph are put back together with nothing

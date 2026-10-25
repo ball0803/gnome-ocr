@@ -137,6 +137,10 @@ The recogniser says whether a space follows each word it found, so where the
 text is set with spaces between its words the lines are joined with a space,
 and where it is not, as in Japanese, nothing goes between them.
 
+The entries of a list are apart on the page, so the space that goes between
+them is one of ours, and it is the ideographic space, which is how a gap is
+marked in Japanese. The spaces that were on the page are left as they were.
+
 Where the page has a large gap between two pieces of text, the break is kept
 and the next piece is set out with an ideographic space, which is how a
 paragraph is marked in Japanese.
