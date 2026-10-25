@@ -513,8 +513,11 @@ struct Window {
     pointer: RefCell<Option<(f64, f64)>>,
     /// Whether the pointer was over the text rather than the preview.
     over_text: Cell<bool>,
-    /// The timer that looks the word up once the pointer has rested.
-    scan_source: RefCell<Option<glib::SourceId>>,
+    /// How long ago the pointer moved, in seconds.
+    last_moved: Cell<f64>,
+    /// Whether the word under the pointer has been looked up since it last
+    /// moved.
+    scanned: Cell<bool>,
     settings: settings::Shared,
     copy_button: gtk::Button,
     clear_button: gtk::Button,
@@ -757,7 +760,8 @@ impl Window {
             keys: Cell::new(gdk::ModifierType::empty()),
             pointer: RefCell::new(None),
             over_text: Cell::new(false),
-            scan_source: RefCell::new(None),
+            last_moved: Cell::new(0.0),
+            scanned: Cell::new(false),
             settings: settings.clone(),
             copy_button,
             clear_button,
@@ -801,11 +805,20 @@ impl Window {
             }
         });
 
+        // One timer for the whole life of the app, which looks the word up
+        // once the pointer has rested over it.
+        let owner = Rc::clone(&window);
+        glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+            owner.tick();
+            glib::ControlFlow::Continue
+        });
+
         window.root.present();
         window
     }
 
-    /// The width of the window.
+    /// How long it is since the machine started, in seconds.
+/// The width of the window.
     fn width(&self) -> i32 {
         self.root.default_width()
     }
@@ -1442,14 +1455,14 @@ impl Window {
             settings.modifier
         );
         if !held.contains(settings.modifier.mask()) {
-            self.cancel_scan();
             self.hovered_word(None);
             self.card.hide();
             return;
         }
         self.over_text.set(false);
+        self.last_moved.set(now_seconds());
+        self.scanned.set(false);
         *self.pointer.borrow_mut() = Some((x, y));
-        self.restart_scan(settings.scan_delay);
     }
 
     /// The pointer moved over the text.
@@ -1466,8 +1479,9 @@ impl Window {
             return;
         }
         self.over_text.set(true);
+        self.last_moved.set(now_seconds());
+        self.scanned.set(false);
         *self.pointer.borrow_mut() = Some((x, y));
-        self.restart_scan(settings.scan_delay);
     }
 
     /// A key was pressed or released.
@@ -1481,6 +1495,7 @@ impl Window {
         }
         tracing::debug!("a key was pressed or released; the keys held are {held:?}");
         self.keys.set(held);
+        self.scanned.set(false);
     }
 
     /// The keys that are held down.
@@ -1503,30 +1518,32 @@ impl Window {
         let settings = crate::settings::read(&self.settings);
         if self.keys_held().contains(settings.modifier.mask()) {
             tracing::debug!("the keys changed, and the key wanted is held");
-            self.restart_scan(settings.scan_delay);
+            self.scanned.set(false);
         }
     }
 
-    /// Starts the timer that looks the word up.
-    fn restart_scan(self: &Rc<Self>, delay: u32) {
-        self.cancel_scan();
-        let owner = Rc::clone(self);
-        let source = glib::timeout_add_local(std::time::Duration::from_millis(delay.into()), move || {
-            owner.scan();
-            glib::ControlFlow::Break
-        });
-        *self.scan_source.borrow_mut() = Some(source);
-    }
-
-    /// Stops the timer, so that a word is not looked up that should not be.
-    fn cancel_scan(&self) {
-        if let Some(source) = self.scan_source.borrow_mut().take() {
-            source.remove();
+    /// Looks the word up, if the pointer has rested over one long enough.
+    ///
+    /// The timer runs for as long as the app does, so that there is never a
+    /// timer to take away. Taking away a timer that has already fired stops
+    /// the app, which is what the earlier one did.
+    fn tick(&self) {
+        let settings = crate::settings::read(&self.settings);
+        if !self.keys_held().contains(settings.modifier.mask()) {
+            return;
         }
+        let delay = f64::from(settings.scan_delay) / 1000.0;
+        if now_seconds() - self.last_moved.get() < delay {
+            return;
+        }
+        if self.scanned.replace(true) {
+            return;
+        }
+        self.scan();
     }
 
     /// Looks up the word the pointer is over.
-    fn scan(self: &Rc<Self>) {
+    fn scan(&self) {
         let Some((x, y)) = *self.pointer.borrow() else {
             return;
         };
@@ -1841,6 +1858,10 @@ fn settings_panel(settings: settings::Shared) -> (gtk::Box, gtk::CheckButton) {
     });
 
     (panel, readings)
+}
+
+fn now_seconds() -> f64 {
+    std::time::Instant::now().elapsed().as_secs_f64()
 }
 
 fn labelled(text: &str, control: &impl IsA<gtk::Widget>, tooltip: &str) -> gtk::Box {
