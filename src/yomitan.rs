@@ -51,6 +51,19 @@ pub struct Segment {
     pub reading: Option<String>,
 }
 
+/// A tag the dictionary gives a word.
+///
+/// The dictionary says what kind of tag it is, so that the part of speech can
+/// be told from the markers that say how common the word is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tag {
+    /// What the tag says.
+    pub name: String,
+    /// What kind of tag it is: "partOfSpeech", "popular", "frequent", and
+    /// so on.
+    pub category: String,
+}
+
 /// A word, as the dictionary has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -59,7 +72,7 @@ pub struct Entry {
     /// The meanings, one per line, already flattened to plain text.
     pub definitions: Vec<String>,
     /// The tags, such as the part of speech.
-    pub tags: Vec<String>,
+    pub tags: Vec<Tag>,
     /// Which dictionary it came from, when it says.
     pub dictionary: Option<String>,
 }
@@ -352,6 +365,10 @@ struct Headword {
 struct WordTag {
     #[serde(default)]
     name: String,
+    /// What kind of tag it is: "partOfSpeech", "popular", "frequent", and
+    /// so on.
+    #[serde(default)]
+    category: String,
 }
 
 /// One meaning of a word, as one dictionary has it.
@@ -415,12 +432,12 @@ fn build_entry(source: SourceEntry) -> Entry {
     let mut tags = Vec::new();
     for headword in &source.headwords {
         for tag in &headword.tags {
-            push_tag(&mut tags, &tag.name);
+            push_tag(&mut tags, &tag.name, &tag.category);
         }
     }
     for definition in &source.definitions {
         for tag in &definition.tags {
-            push_tag(&mut tags, &tag.name);
+            push_tag(&mut tags, &tag.name, &tag.category);
         }
     }
 
@@ -448,11 +465,14 @@ fn build_entry(source: SourceEntry) -> Entry {
 }
 
 /// Adds a tag to the list, keeping the list free of repeats.
-fn push_tag(tags: &mut Vec<String>, name: &str) {
-    if name.is_empty() || tags.iter().any(|tag| tag == name) {
+fn push_tag(tags: &mut Vec<Tag>, name: &str, category: &str) {
+    if name.is_empty() || tags.iter().any(|tag| tag.name == name) {
         return;
     }
-    tags.push(name.to_owned());
+    tags.push(Tag {
+        name: name.to_owned(),
+        category: category.to_owned(),
+    });
 }
 
 /// Flattens the tree of a meaning into the lines of plain text.
@@ -746,7 +766,11 @@ mod tests {
         assert_eq!(entry.term, "人気");
         assert_eq!(entry.reading, Some("にんき".to_owned()));
         assert_eq!(entry.dictionary, Some("Jitendex.org".to_owned()));
-        assert_eq!(entry.tags, vec!["n".to_owned(), "★".to_owned()]);
+        assert_eq!(entry.tags.len(), 2);
+        assert_eq!(entry.tags[0].name, "n");
+        assert_eq!(entry.tags[0].category, "partOfSpeech");
+        assert_eq!(entry.tags[1].name, "★");
+        assert_eq!(entry.tags[1].category, "popular");
         assert_eq!(
             entry.definitions,
             vec![

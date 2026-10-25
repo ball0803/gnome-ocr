@@ -571,6 +571,7 @@ fn mean_luma(rgba: &[u8]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+
     /// The engine that comes with a bundle of the app sits next to the
     /// program, and is looked for before the ones on the machine.
     #[test]

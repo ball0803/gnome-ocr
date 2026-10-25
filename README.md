@@ -207,7 +207,26 @@ The readings come from Yomitan, so it has to be running for them to be had;
 the text that is copied is the plain text either way.
 
 **Look up**, in the toolbar, asks the dictionary about the words that are
-selected in the text, and shows what it says underneath.
+selected in the text, and shows what it says in a card.
+
+### Looking up a word under the pointer
+
+Hold the **scan modifier key** and move the pointer over a word in the
+preview, and the word under it is looked up and the card appears beside the
+pointer. This is how Yomitan works on a web page, and the app does the same
+over the screen it is capturing.
+
+Two settings control it, both in the settings:
+
+| Setting | What it does |
+|---|---|
+| Scan modifier key | The key that has to be held down while the pointer moves. Without it, moving the pointer over the preview asks for nothing. |
+| Scan delay | How long the pointer has to rest over a word, in milliseconds, before it is looked up. |
+
+The word is found from where the recogniser said it was, so nothing is read
+again for it, and the pointer has to rest before anything is asked, so that
+sweeping the pointer across the screen does not fill the dictionary's
+attention.
 
 Yomitan has to be set up to answer requests from outside the browser. Its
 API is served on `http://127.0.0.1:19633`, and the guide for setting it up

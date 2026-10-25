@@ -366,16 +366,23 @@ struct Piece {
 enum Asking {
     /// The readings of a piece of text.
     Readings { piece: usize, text: String },
-    /// The dictionary entries for a word.
-    Entries { text: String },
+    /// The dictionary entries for the words that were selected in the text.
+    Selected { text: String },
+    /// The dictionary entries for the word the pointer is over.
+    Pointed { text: String },
 }
 
 /// What came back.
 enum Answer {
     /// The readings of a piece of text.
     Readings { piece: usize, text: String },
-    /// The entries of a word.
-    Entries { text: String, entries: Vec<crate::yomitan::Entry> },
+    /// The entries of a word, and where they were asked for.
+    Entries {
+        text: String,
+        entries: Vec<crate::yomitan::Entry>,
+        /// Whether the pointer was over the word.
+        pointed: bool,
+    },
     /// The API did not answer.
     Failed,
 }
@@ -409,12 +416,27 @@ impl Reader {
                             let _ = done.try_send(Answer::Readings { piece, text: annotated });
                         }
                     }
-                    Asking::Entries { text } => {
+                    Asking::Selected { text } => {
                         let Ok(entries) = crate::yomitan::entries(&text) else {
                             let _ = done.try_send(Answer::Failed);
                             continue;
                         };
-                        let _ = done.try_send(Answer::Entries { text, entries });
+                        let _ = done.try_send(Answer::Entries {
+                            text,
+                            entries,
+                            pointed: false,
+                        });
+                    }
+                    Asking::Pointed { text } => {
+                        let Ok(entries) = crate::yomitan::entries(&text) else {
+                            let _ = done.try_send(Answer::Failed);
+                            continue;
+                        };
+                        let _ = done.try_send(Answer::Entries {
+                            text,
+                            entries,
+                            pointed: true,
+                        });
                     }
                 }
             }
@@ -443,8 +465,11 @@ struct Window {
     popover: gtk::Popover,
     readings: gtk::CheckButton,
     lookup_button: gtk::Button,
-    lookup: gtk::ScrolledWindow,
-    lookup_label: gtk::Label,
+    card: crate::card::Card,
+    /// Where the pointer was, in the pixels of the preview.
+    pointer: RefCell<Option<(f64, f64)>>,
+    /// The timer that looks the word up once the pointer has rested.
+    scan_source: RefCell<Option<glib::SourceId>>,
     settings: settings::Shared,
     copy_button: gtk::Button,
     clear_button: gtk::Button,
@@ -616,21 +641,6 @@ impl Window {
             .margin_bottom(12)
             .build();
 
-        let lookup_label = gtk::Label::new(None);
-        lookup_label.set_xalign(0.0);
-        lookup_label.set_use_markup(true);
-        lookup_label.set_margin_top(6);
-        lookup_label.set_margin_bottom(6);
-        lookup_label.set_margin_start(12);
-        lookup_label.set_margin_end(12);
-        lookup_label.set_selectable(true);
-        let lookup = gtk::ScrolledWindow::builder()
-            .hexpand(true)
-            .max_content_height(180)
-            .child(&lookup_label)
-            .build();
-        lookup.set_visible(false);
-
         let stack = gtk::Stack::new();
         stack.add_named(&scroller, Some("text"));
         stack.add_named(&list_scroller, Some("list"));
@@ -654,7 +664,6 @@ impl Window {
         output_pane.set_margin_bottom(8);
         output_pane.append(&mode_row);
         output_pane.append(&stack);
-        output_pane.append(&lookup);
 
         let split = gtk::Paned::new(gtk::Orientation::Horizontal);
         split.set_start_child(Some(&preview_pane));
@@ -699,8 +708,9 @@ impl Window {
             popover,
             readings,
             lookup_button: lookup_button.clone(),
-            lookup,
-            lookup_label,
+            card: crate::card::Card::new(),
+            pointer: RefCell::new(None),
+            scan_source: RefCell::new(None),
             settings: settings.clone(),
             copy_button,
             clear_button,
@@ -840,6 +850,15 @@ impl Window {
 
     /// Lets the user draw, move and resize the crop rectangle.
     fn wire_drag(self: &Rc<Self>) {
+        // Where the pointer moves is watched, so that the word under it can
+        // be looked up once it has rested there.
+        let motion = gtk::EventControllerMotion::new();
+        let owner = Rc::clone(self);
+        motion.connect_motion(move |controller, x, y| {
+            owner.pointer_moved(x, y, controller.current_event_state());
+        });
+        self.canvas.add_controller(motion);
+
         let drag = gtk::GestureDrag::new();
 
         let begin = Rc::clone(&self.preview);
@@ -995,7 +1014,7 @@ impl Window {
             if text.is_empty() {
                 return;
             }
-            let _ = owner.reader.jobs.try_send(Asking::Entries { text });
+            let _ = owner.reader.jobs.try_send(Asking::Selected { text });
         });
 
         // Turning the readings on asks for the readings of what is already
@@ -1068,7 +1087,11 @@ impl Window {
             while let Ok(answer) = answers.recv().await {
                 match answer {
                     Answer::Readings { piece, text } => owner.set_reading(piece, text),
-                    Answer::Entries { text, entries } => owner.show_entries(&text, &entries),
+                    Answer::Entries {
+                        text,
+                        entries,
+                        pointed,
+                    } => owner.show_entries(pointed, &text, &entries),
                     Answer::Failed => owner.set_status(
                         "Yomitan is not answering. It has to be running, with the API \
                          turned on, for the readings and the lookups.",
@@ -1306,37 +1329,84 @@ impl Window {
         self.render();
     }
 
+    /// The pointer moved over the preview.
+    ///
+    /// The word under it is looked up when the pointer has rested there long
+    /// enough, and only while the modifier key is held down, so that moving
+    /// the pointer over the preview does not keep asking the dictionary.
+    fn pointer_moved(self: &Rc<Self>, x: f64, y: f64, state: gdk::ModifierType) {
+        let settings = crate::settings::read(&self.settings);
+        if !state.contains(settings.modifier.mask()) {
+            self.cancel_scan();
+            self.card.hide();
+            return;
+        }
+        *self.pointer.borrow_mut() = Some((x, y));
+        self.restart_scan(settings.scan_delay);
+    }
+
+    /// Starts the timer that looks the word up.
+    fn restart_scan(self: &Rc<Self>, delay: u32) {
+        self.cancel_scan();
+        let owner = Rc::clone(self);
+        let source = glib::timeout_add_local(std::time::Duration::from_millis(delay.into()), move || {
+            owner.scan();
+            glib::ControlFlow::Break
+        });
+        *self.scan_source.borrow_mut() = Some(source);
+    }
+
+    /// Stops the timer, so that a word is not looked up that should not be.
+    fn cancel_scan(&self) {
+        if let Some(source) = self.scan_source.borrow_mut().take() {
+            source.remove();
+        }
+    }
+
+    /// Looks up the word the pointer is over.
+    fn scan(self: &Rc<Self>) {
+        let Some((x, y)) = *self.pointer.borrow() else {
+            return;
+        };
+        let (frame_width, frame_height) = self.preview.frame_size.get();
+        let Some(drawn) = self.preview.rect.get() else {
+            return;
+        };
+        let lines = self.preview.detections.borrow().clone();
+        let point = crate::hover::Point::new(x, y);
+        let Some(word) = crate::hover::word_under(&lines, point, frame_width, frame_height, drawn)
+        else {
+            self.card.hide();
+            return;
+        };
+        let text = word.text.trim().to_owned();
+        if text.is_empty() {
+            self.card.hide();
+            return;
+        }
+        let _ = self.reader.jobs.try_send(Asking::Pointed { text });
+    }
+
     /// Shows what the dictionary says about a word.
-    fn show_entries(&self, text: &str, entries: &[crate::yomitan::Entry]) {
-        let mut markup = String::new();
-        for entry in entries.iter().take(6) {
-            markup.push_str(&format!(
-                "<b>{}</b>",
-                glib::markup_escape_text(&entry.term)
-            ));
-            if let Some(reading) = &entry.reading {
-                markup.push_str(&format!(" {}", glib::markup_escape_text(reading)));
-            }
-            markup.push('\n');
-            for definition in &entry.definitions {
-                markup.push_str(&format!("  {}\n", glib::markup_escape_text(definition)));
-            }
-            if !entry.tags.is_empty() {
-                markup.push_str(&format!(
-                    "  {}\n",
-                    glib::markup_escape_text(&entry.tags.join(", "))
-                ));
-            }
-            markup.push('\n');
+    ///
+    /// The card appears beside the pointer when the pointer was over the word,
+    /// and beside the text when the words were selected in it.
+    fn show_entries(&self, pointed: bool, text: &str, entries: &[crate::yomitan::Entry]) {
+        if entries.is_empty() {
+            self.set_status(&format!("Nothing is known about {text}."));
+            self.card.hide();
+            return;
         }
-        if markup.is_empty() {
-            markup = format!(
-                "Nothing is known about {}.",
-                glib::markup_escape_text(text)
-            );
+        let reading = entries.first().and_then(|entry| entry.reading.clone());
+        let word = entries
+            .first()
+            .map(|entry| entry.term.clone())
+            .unwrap_or_else(|| text.to_owned());
+        if pointed {
+            self.card.show(&self.canvas, &word, reading.as_deref(), entries);
+        } else {
+            self.card.show(&self.text_view, &word, reading.as_deref(), entries);
         }
-        self.lookup_label.set_markup(&markup);
-        self.lookup.set_visible(true);
     }
 
     /// Asks for the readings of the text that is already shown, which is
@@ -1436,6 +1506,45 @@ fn settings_panel(settings: settings::Shared) -> (gtk::Box, gtk::CheckButton) {
     ));
     panel.append(&lists);
 
+    let modifier_names = ["None", "Shift", "Control", "Alt"];
+    let modifier = gtk::DropDown::from_strings(&modifier_names);
+    modifier.set_selected(
+        modifier_names
+            .iter()
+            .position(|name| *name == current.modifier.name())
+            .unwrap_or(0) as u32,
+    );
+    modifier.set_tooltip_text(Some(
+        "Hold this key while the pointer moves over a word, for the word to be \
+         looked up.",
+    ));
+    panel.append(&labelled(
+        "Scan modifier key",
+        &modifier,
+        "Hold this key while the pointer moves over a word, for the word to be \
+         looked up.",
+    ));
+
+    let delay_adjustment = gtk::Adjustment::new(
+        f64::from(current.scan_delay),
+        0.0,
+        2000.0,
+        10.0,
+        50.0,
+        0.0,
+    );
+    let delay = gtk::SpinButton::new(Some(&delay_adjustment), 10.0, 2000);
+    delay.set_tooltip_text(Some(
+        "How long the pointer has to rest over a word, in milliseconds, before \
+         the word is looked up.",
+    ));
+    panel.append(&labelled(
+        "Scan delay (in milliseconds)",
+        &delay,
+        "How long the pointer has to rest over a word, in milliseconds, before \
+         the word is looked up.",
+    ));
+
     let readings = gtk::CheckButton::with_label("Show the readings");
     readings.set_active(current.readings);
     readings.set_tooltip_text(Some(
@@ -1457,6 +1566,27 @@ fn settings_panel(settings: settings::Shared) -> (gtk::Box, gtk::CheckButton) {
     dimension.connect_value_changed(move |spin| {
         if let Ok(mut settings) = for_dimension.lock() {
             settings.dimension = spin.value();
+        }
+    });
+
+    let for_modifier = settings.clone();
+    modifier.connect_selected_notify(move |drop| {
+        let index = drop.selected() as usize;
+        let Some(name) = modifier_names.get(index) else {
+            return;
+        };
+        let Some(modifier) = settings::Modifier::from_name(name) else {
+            return;
+        };
+        if let Ok(mut settings) = for_modifier.lock() {
+            settings.modifier = modifier;
+        }
+    });
+
+    let for_delay = settings.clone();
+    delay.connect_value_changed(move |spin| {
+        if let Ok(mut settings) = for_delay.lock() {
+            settings.scan_delay = spin.value().max(0.0) as u32;
         }
     });
 
@@ -1484,7 +1614,7 @@ fn settings_panel(settings: settings::Shared) -> (gtk::Box, gtk::CheckButton) {
     (panel, readings)
 }
 
-fn labelled(text: &str, control: &gtk::SpinButton, tooltip: &str) -> gtk::Box {
+fn labelled(text: &str, control: &impl IsA<gtk::Widget>, tooltip: &str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let label = gtk::Label::new(Some(text));
     label.set_xalign(0.0);
