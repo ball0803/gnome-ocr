@@ -22,6 +22,9 @@ use crate::region::Region;
 
 const APP_ID: &str = "dev.local.gnome_ocr";
 
+/// The width of the window.
+const WINDOW_WIDTH: i32 = 1240;
+
 /// How many entries the list keeps before the oldest are dropped.
 const MAX_LIST_ENTRIES: usize = 200;
 
@@ -359,11 +362,14 @@ struct Window {
     text_view: gtk::TextView,
     buffer: gtk::TextBuffer,
     canvas: gtk::DrawingArea,
+    split: gtk::Paned,
+    preview_pane: gtk::Box,
     start_button: gtk::Button,
     stop_button: gtk::Button,
     change_button: gtk::Button,
     reset_button: gtk::Button,
     show_boxes: gtk::CheckButton,
+    preview_button: gtk::ToggleButton,
     mode: gtk::DropDown,
     stack: gtk::Stack,
     list: gtk::ListBox,
@@ -536,10 +542,15 @@ impl Window {
         stack.add_named(&list_scroller, Some("list"));
         stack.set_visible_child_name("text");
 
+        let preview_button = gtk::ToggleButton::with_label("Preview");
+        preview_button.set_active(true);
+        preview_button.set_tooltip_text(Some("Show or hide the picture of what is captured."));
+
         let mode_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         mode_row.set_margin_start(6);
         mode_row.set_margin_end(12);
         mode_row.set_margin_bottom(6);
+        mode_row.append(&preview_button);
         mode_row.append(&gtk::Label::new(Some("Show as")));
         mode_row.append(&mode);
 
@@ -553,9 +564,9 @@ impl Window {
         let split = gtk::Paned::new(gtk::Orientation::Horizontal);
         split.set_start_child(Some(&preview_pane));
         split.set_end_child(Some(&output_pane));
-        split.set_position(560);
         split.set_vexpand(true);
         split.set_wide_handle(true);
+        split.set_position(WINDOW_WIDTH / 4);
 
         let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
         layout.append(&toolbar);
@@ -576,11 +587,14 @@ impl Window {
             text_view,
             buffer,
             canvas: canvas.clone(),
+            split: split.clone(),
+            preview_pane: preview_pane.clone(),
             start_button,
             stop_button,
             change_button,
             reset_button,
             show_boxes,
+            preview_button,
             mode,
             stack,
             list,
@@ -617,8 +631,23 @@ impl Window {
             gtk::glib::Propagation::Proceed
         });
 
+        // The preview is a quarter of the width and the text the rest, and
+        // that is kept when the window is resized.
+        let for_width = window.clone();
+        window.root.connect_notify_local(Some("default-width"), move |root, _| {
+            let width = root.default_width();
+            if width > 0 {
+                for_width.split.set_position(width / 4);
+            }
+        });
+
         window.root.present();
         window
+    }
+
+    /// The width of the window.
+    fn width(&self) -> i32 {
+        self.root.default_width()
     }
 
     /// Paints the captured frame at its own size, with the crop on top.
@@ -854,6 +883,17 @@ impl Window {
         });
 
         let owner = Rc::clone(self);
+        self.preview_button.connect_toggled(move |button| {
+            let showing = button.is_active();
+            if showing {
+                owner.split.set_start_child(Some(&owner.preview_pane));
+                owner.split.set_position(owner.width() / 4);
+            } else {
+                owner.split.set_start_child(None::<&gtk::Box>);
+            }
+        });
+
+        let owner = Rc::clone(self);
         self.show_boxes.connect_toggled(move |button| {
             owner.preview.show_boxes.set(button.is_active());
             owner.canvas.queue_draw();
@@ -954,11 +994,7 @@ impl Window {
 
                 if !fresh.is_empty() {
                     // The blocks are already in reading order.
-                    let joined = fresh
-                        .iter()
-                        .map(|block| block.text())
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let joined = crate::layout::join_blocks(&fresh, layout.block_gap);
                     self.append(&format!("{joined}\n"));
                     if self.auto_copy.is_active() {
                         self.root.clipboard().set_text(&joined);

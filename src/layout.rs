@@ -366,6 +366,9 @@ impl Block {
 #[derive(Debug, Default)]
 pub struct Layout {
     pub blocks: Vec<Block>,
+    /// The gap that sets one block apart from the next, worked out from the
+    /// page. A gap larger than this is a break between paragraphs.
+    pub block_gap: f64,
 }
 
 impl Layout {
@@ -487,13 +490,13 @@ pub fn analyse(lines: &[Line], clump: bool, lists: bool) -> Layout {
     let (vertical, horizontal): (Vec<&Line>, Vec<&Line>) =
         text_lines.iter().partition(|line| line.is_vertical);
 
-    let mut blocks = order_horizontal(&horizontal, median_height, clump, lists);
+    let (mut blocks, block_gap) = order_horizontal(&horizontal, median_height, clump, lists);
 
     // Vertical runs are read from the right, and come after the horizontal
     // ones.
     blocks.extend(order_vertical(&vertical));
 
-    Layout { blocks }
+    Layout { blocks, block_gap }
 }
 
 /// The height that most of the lines share, which is the size of ordinary
@@ -535,9 +538,9 @@ fn order_horizontal(
     median_height: f64,
     clump: bool,
     lists: bool,
-) -> Vec<Block> {
+) -> (Vec<Block>, f64) {
     if lines.is_empty() {
-        return Vec::new();
+        return (Vec::new(), median_height);
     }
 
     // The lines of a page arrive in no order at all, and the entries of a
@@ -647,7 +650,27 @@ fn order_horizontal(
         items.push(heading);
     }
 
-    place_items(items, median_height)
+    let placed = place_items(items, median_height);
+    (placed, threshold.unwrap_or(median_height))
+}
+
+/// Joins the blocks into text, leaving a blank line where the page has a
+/// large gap between two of them.
+pub fn join_blocks(blocks: &[Block], block_gap: f64) -> String {
+    let mut text = String::new();
+    let mut previous: Option<Rect> = None;
+    for block in blocks {
+        let bounds = block.bounds();
+        if let Some(previous) = previous {
+            text.push('\n');
+            if bounds.y - previous.bottom() > block_gap {
+                text.push('\n');
+            }
+        }
+        text.push_str(&block.text());
+        previous = Some(bounds);
+    }
+    text
 }
 
 /// Orders the lines that run downwards.
@@ -1216,6 +1239,23 @@ mod tests {
         };
         assert_eq!(lists(&gathered), 1, "the menu should be gathered");
         assert_eq!(lists(&apart), 0, "the menu should not be gathered");
+    }
+
+    /// A large gap between two blocks leaves a blank line in the text, so
+    /// that the break on the page is kept.
+    #[test]
+    fn a_large_gap_leaves_a_blank_line_in_the_text() {
+        let mut first = line("above", 60.0, 100.0, 200.0, 20.0);
+        first.block_id = 1;
+        let mut second = line("below", 60.0, 300.0, 200.0, 20.0);
+        second.block_id = 2;
+
+        let layout = analyse(&[first, second], true, true);
+        let text = crate::layout::join_blocks(&layout.blocks, layout.block_gap);
+        assert!(
+            text.contains("\n\n"),
+            "a large gap should leave a blank line, got {text:?}"
+        );
     }
 
     /// With the joining turned off, each line keeps its own line.

@@ -74,6 +74,10 @@ Only the cropped part of the frame is recognised. The crop is kept as a
 fraction of the frame, so it stays put when the captured window is resized.
 **Whole capture** goes back to recognising everything.
 
+**Preview** shows or hides the picture of what is captured, next to **Show as**.
+The preview is a quarter of the width and the text the rest, and that is kept
+when the window is resized.
+
 **Show where text was found** draws a box around every line the recogniser
 picked up, so you can see where the text on screen came from. The crop you
 draw on the preview is kept as a part of the frame, so resizing the window
@@ -127,6 +131,9 @@ document analysis literature does it:
   gathered into one list, which is how the entries of a menu are kept
   together. An entry that is indented further along is at a different level
   and starts a list of its own
+
+Where the page has a large gap between two pieces of text, a blank line is
+left between them in the output, so that the break is kept.
 
 Every threshold used for this is a ratio of something measured from the page
 itself, never an absolute size: the size of the ordinary text comes from the
