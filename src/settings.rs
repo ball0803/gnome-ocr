@@ -24,6 +24,12 @@ pub struct Settings {
     /// Whether the runs of short, aligned entries are gathered into one list,
     /// rather than each entry being kept on its own.
     pub lists: bool,
+    /// Whether the readings of the words are shown with the text, as
+    /// 人気（にんき）のおかず.
+    ///
+    /// The readings come from Yomitan, which has to be running for them to
+    /// be had. The text that is copied is the plain text either way.
+    pub readings: bool,
 }
 
 impl Default for Settings {
@@ -33,6 +39,7 @@ impl Default for Settings {
             dimension: 0.9,
             clump: true,
             lists: true,
+            readings: false,
         }
     }
 }

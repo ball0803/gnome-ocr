@@ -354,6 +354,75 @@ pub fn run(japanese_only: bool) -> glib::ExitCode {
     app.run()
 }
 
+/// A piece of the text that was shown.
+struct Piece {
+    /// The text as it was recognised.
+    plain: String,
+    /// The same text with the readings marked, when they have arrived.
+    annotated: Option<String>,
+}
+
+/// Something to ask Yomitan about.
+enum Asking {
+    /// The readings of a piece of text.
+    Readings { piece: usize, text: String },
+    /// The dictionary entries for a word.
+    Entries { text: String },
+}
+
+/// What came back.
+enum Answer {
+    /// The readings of a piece of text.
+    Readings { piece: usize, text: String },
+    /// The entries of a word.
+    Entries { text: String, entries: Vec<crate::yomitan::Entry> },
+    /// The API did not answer.
+    Failed,
+}
+
+/// The work of asking Yomitan what the text means.
+///
+/// The reading is fetched on a thread of its own, so the window stays quick,
+/// and the answers come back through a channel.
+struct Reader {
+    jobs: async_channel::Sender<Asking>,
+    answers: async_channel::Receiver<Answer>,
+}
+
+impl Reader {
+    fn start() -> Self {
+        let (jobs, work) = async_channel::unbounded::<Asking>();
+        let (done, answers) = async_channel::unbounded::<Answer>();
+        std::thread::spawn(move || {
+            while let Ok(asking) = work.recv_blocking() {
+                match asking {
+                    Asking::Readings { piece, text } => {
+                        let Ok(segments) = crate::yomitan::tokenize(&text) else {
+                            let _ = done.try_send(Answer::Failed);
+                            continue;
+                        };
+                        if segments.is_empty() {
+                            continue;
+                        }
+                        let annotated = crate::yomitan::with_readings(&text, &segments);
+                        if !annotated.is_empty() {
+                            let _ = done.try_send(Answer::Readings { piece, text: annotated });
+                        }
+                    }
+                    Asking::Entries { text } => {
+                        let Ok(entries) = crate::yomitan::entries(&text) else {
+                            let _ = done.try_send(Answer::Failed);
+                            continue;
+                        };
+                        let _ = done.try_send(Answer::Entries { text, entries });
+                    }
+                }
+            }
+        });
+        Self { jobs, answers }
+    }
+}
+
 struct Window {
     root: gtk::ApplicationWindow,
     text_view: gtk::TextView,
@@ -372,6 +441,10 @@ struct Window {
     list: gtk::ListBox,
     settings_button: gtk::Button,
     popover: gtk::Popover,
+    readings: gtk::CheckButton,
+    lookup_button: gtk::Button,
+    lookup: gtk::ScrolledWindow,
+    lookup_label: gtk::Label,
     settings: settings::Shared,
     copy_button: gtk::Button,
     clear_button: gtk::Button,
@@ -389,7 +462,8 @@ struct Window {
     restore_token: Arc<Mutex<Option<String>>>,
     pipeline: RefCell<Option<Pipeline>>,
     japanese_only: bool,
-    lines: RefCell<Vec<String>>,
+    pieces: RefCell<Vec<Piece>>,
+    reader: Reader,
 }
 
 impl Window {
@@ -412,6 +486,12 @@ impl Window {
         let reset_button = pill("Whole capture", None);
         reset_button.set_tooltip_text(Some("Recognise the whole frame again."));
         reset_button.set_sensitive(false);
+
+        let lookup_button = pill("Look up", None);
+        lookup_button.set_tooltip_text(Some(
+            "Look the selected words up in the dictionary of Yomitan.",
+        ));
+        lookup_button.set_sensitive(false);
 
         let copy_button = pill("Copy all", None);
         let clear_button = pill("Clear", None);
@@ -437,6 +517,7 @@ impl Window {
         toolbar.append(&gtk::Label::new(Some("Auto-copy new text")));
         toolbar.append(&auto_copy);
         toolbar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+        toolbar.append(&lookup_button);
         toolbar.append(&copy_button);
         toolbar.append(&clear_button);
         toolbar.append(&settings_button);
@@ -535,6 +616,21 @@ impl Window {
             .margin_bottom(12)
             .build();
 
+        let lookup_label = gtk::Label::new(None);
+        lookup_label.set_xalign(0.0);
+        lookup_label.set_use_markup(true);
+        lookup_label.set_margin_top(6);
+        lookup_label.set_margin_bottom(6);
+        lookup_label.set_margin_start(12);
+        lookup_label.set_margin_end(12);
+        lookup_label.set_selectable(true);
+        let lookup = gtk::ScrolledWindow::builder()
+            .hexpand(true)
+            .max_content_height(180)
+            .child(&lookup_label)
+            .build();
+        lookup.set_visible(false);
+
         let stack = gtk::Stack::new();
         stack.add_named(&scroller, Some("text"));
         stack.add_named(&list_scroller, Some("list"));
@@ -558,6 +654,7 @@ impl Window {
         output_pane.set_margin_bottom(8);
         output_pane.append(&mode_row);
         output_pane.append(&stack);
+        output_pane.append(&lookup);
 
         let split = gtk::Paned::new(gtk::Orientation::Horizontal);
         split.set_start_child(Some(&preview_pane));
@@ -577,7 +674,8 @@ impl Window {
         let settings = settings::shared();
         let popover = gtk::Popover::new();
         popover.set_parent(&settings_button);
-        popover.set_child(Some(&settings_panel(settings.clone())));
+        let (panel, readings) = settings_panel(settings.clone());
+        popover.set_child(Some(&panel));
 
         let (events, inbox) = async_channel::bounded::<Event>(64);
 
@@ -599,6 +697,10 @@ impl Window {
             list,
             settings_button,
             popover,
+            readings,
+            lookup_button: lookup_button.clone(),
+            lookup,
+            lookup_label,
             settings: settings.clone(),
             copy_button,
             clear_button,
@@ -614,13 +716,15 @@ impl Window {
             restore_token: Arc::new(Mutex::new(None)),
             pipeline: RefCell::new(None),
             japanese_only,
-            lines: RefCell::new(Vec::new()),
+            pieces: RefCell::new(Vec::new()),
+            reader: Reader::start(),
         });
 
         window.draw_preview();
         window.wire_drag();
         window.wire();
         window.consume(inbox);
+        window.consume_answers();
 
         let closing = Rc::clone(&window);
         window.root.connect_close_request(move |_| {
@@ -872,6 +976,37 @@ impl Window {
             owner.popover.popup();
         });
 
+        // The button is only of use when something is selected.
+        let owner = Rc::clone(self);
+        self.text_view.buffer().connect_notify_local(
+            Some("has-selection"),
+            move |buffer, _| {
+                owner.lookup_button.set_sensitive(buffer.has_selection());
+            },
+        );
+
+        let owner = Rc::clone(self);
+        self.lookup_button.connect_clicked(move |_| {
+            let Some((start, end)) = owner.buffer.selection_bounds() else {
+                return;
+            };
+            let text = owner.buffer.text(&start, &end, false).to_string();
+            let text = text.trim().to_owned();
+            if text.is_empty() {
+                return;
+            }
+            let _ = owner.reader.jobs.try_send(Asking::Entries { text });
+        });
+
+        // Turning the readings on asks for the readings of what is already
+        // shown, so that the whole text has them.
+        let owner = Rc::clone(self);
+        self.readings.connect_toggled(move |button| {
+            if button.is_active() {
+                owner.read_again();
+            }
+        });
+
         let owner = Rc::clone(self);
         self.mode.connect_selected_notify(move |mode| {
             let page = match mode.selected() {
@@ -922,6 +1057,24 @@ impl Window {
         self.auto_copy.connect_active_notify(move |switch| {
             let state = if switch.is_active() { "on" } else { "off" };
             owner.set_status(&format!("Auto-copy is {state}."));
+        });
+    }
+
+    /// Takes the readings that come back and shows them.
+    fn consume_answers(self: &Rc<Self>) {
+        let owner = Rc::clone(self);
+        let answers = self.reader.answers.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(answer) = answers.recv().await {
+                match answer {
+                    Answer::Readings { piece, text } => owner.set_reading(piece, text),
+                    Answer::Entries { text, entries } => owner.show_entries(&text, &entries),
+                    Answer::Failed => owner.set_status(
+                        "Yomitan is not answering. It has to be running, with the API \
+                         turned on, for the readings and the lookups.",
+                    ),
+                }
+            }
         });
     }
 
@@ -994,9 +1147,13 @@ impl Window {
                 if !fresh.is_empty() {
                     // The blocks are already in reading order.
                     let joined = crate::layout::join_blocks(&fresh);
-                    self.append(&format!("{joined}\n"));
+                    let piece = self.append(&format!("{joined}\n"));
                     if self.auto_copy.is_active() {
                         self.root.clipboard().set_text(&joined);
+                    }
+                    // The reading of the words is asked for, if it is wanted.
+                    if crate::settings::read(&self.settings).readings {
+                        let _ = self.reader.jobs.try_send(Asking::Readings { piece, text: joined });
                     }
                     // The list keeps the picture of the frame the text came
                     // from, so it can be shown next to the text.
@@ -1108,15 +1265,102 @@ impl Window {
         count
     }
 
-    fn append(&self, text: &str) {
-        self.lines.borrow_mut().push(text.to_owned());
-        let all = self.lines.borrow().concat();
+    /// Adds a piece of text and shows it, and says which piece it was.
+    fn append(&self, text: &str) -> usize {
+        let piece = self.pieces.borrow_mut().len();
+        self.pieces.borrow_mut().push(Piece {
+            plain: text.to_owned(),
+            annotated: None,
+        });
+        self.render();
+        piece
+    }
+
+    /// Shows the text as it stands, with the readings where they are known.
+    fn render(&self) {
+        let all = self
+            .pieces
+            .borrow()
+            .iter()
+            .map(|piece| {
+                piece
+                    .annotated
+                    .as_deref()
+                    .unwrap_or(piece.plain.as_str())
+            })
+            .collect::<Vec<_>>()
+            .concat();
         self.buffer.set_text(&all);
         self.scroll_to_end();
     }
 
+    /// Sets the reading of a piece of text and shows it.
+    fn set_reading(&self, piece: usize, annotated: String) {
+        {
+            let mut pieces = self.pieces.borrow_mut();
+            let Some(entry) = pieces.get_mut(piece) else {
+                return;
+            };
+            entry.annotated = Some(annotated);
+        }
+        self.render();
+    }
+
+    /// Shows what the dictionary says about a word.
+    fn show_entries(&self, text: &str, entries: &[crate::yomitan::Entry]) {
+        let mut markup = String::new();
+        for entry in entries.iter().take(6) {
+            markup.push_str(&format!(
+                "<b>{}</b>",
+                glib::markup_escape_text(&entry.term)
+            ));
+            if let Some(reading) = &entry.reading {
+                markup.push_str(&format!(" {}", glib::markup_escape_text(reading)));
+            }
+            markup.push('\n');
+            for definition in &entry.definitions {
+                markup.push_str(&format!("  {}\n", glib::markup_escape_text(definition)));
+            }
+            if !entry.tags.is_empty() {
+                markup.push_str(&format!(
+                    "  {}\n",
+                    glib::markup_escape_text(&entry.tags.join(", "))
+                ));
+            }
+            markup.push('\n');
+        }
+        if markup.is_empty() {
+            markup = format!(
+                "Nothing is known about {}.",
+                glib::markup_escape_text(text)
+            );
+        }
+        self.lookup_label.set_markup(&markup);
+        self.lookup.set_visible(true);
+    }
+
+    /// Asks for the readings of the text that is already shown, which is
+    /// what turning the readings on calls for.
+    fn read_again(&self) {
+        let texts: Vec<String> = self
+            .pieces
+            .borrow()
+            .iter()
+            .map(|piece| piece.plain.clone())
+            .collect();
+        for (piece, text) in texts.into_iter().enumerate() {
+            let _ = self.reader.jobs.try_send(Asking::Readings { piece, text });
+        }
+    }
+
     fn copy_all(&self) {
-        let all = self.lines.borrow().concat();
+        let all = self
+            .pieces
+            .borrow()
+            .iter()
+            .map(|piece| piece.plain.as_str())
+            .collect::<Vec<_>>()
+            .concat();
         let trimmed = all.trim_end();
         if trimmed.is_empty() {
             self.set_status("Nothing to copy yet.");
@@ -1127,7 +1371,7 @@ impl Window {
     }
 
     fn clear(&self) {
-        self.lines.borrow_mut().clear();
+        self.pieces.borrow_mut().clear();
         self.buffer.set_text("");
         while let Some(row) = self.list.first_child() {
             self.list.remove(&row);
@@ -1148,7 +1392,7 @@ impl Window {
 }
 
 /// The settings popover, with a control for each threshold.
-fn settings_panel(settings: settings::Shared) -> gtk::Box {
+fn settings_panel(settings: settings::Shared) -> (gtk::Box, gtk::CheckButton) {
     let panel = gtk::Box::new(gtk::Orientation::Vertical, 8);
     panel.set_margin_top(12);
     panel.set_margin_bottom(12);
@@ -1192,6 +1436,16 @@ fn settings_panel(settings: settings::Shared) -> gtk::Box {
     ));
     panel.append(&lists);
 
+    let readings = gtk::CheckButton::with_label("Show the readings");
+    readings.set_active(current.readings);
+    readings.set_tooltip_text(Some(
+        "When on, the reading of each word is shown with the text, as \
+         人気（にんき）のおかず. The readings come from Yomitan, which has to \
+         be running for them to be had. The text that is copied is the plain \
+         text either way.",
+    ));
+    panel.append(&readings);
+
     let for_overlap = settings.clone();
     overlap.connect_value_changed(move |spin| {
         if let Ok(mut settings) = for_overlap.lock() {
@@ -1203,6 +1457,13 @@ fn settings_panel(settings: settings::Shared) -> gtk::Box {
     dimension.connect_value_changed(move |spin| {
         if let Ok(mut settings) = for_dimension.lock() {
             settings.dimension = spin.value();
+        }
+    });
+
+    let for_readings = settings.clone();
+    readings.connect_toggled(move |button| {
+        if let Ok(mut settings) = for_readings.lock() {
+            settings.readings = button.is_active();
         }
     });
 
@@ -1220,7 +1481,7 @@ fn settings_panel(settings: settings::Shared) -> gtk::Box {
         }
     });
 
-    panel
+    (panel, readings)
 }
 
 fn labelled(text: &str, control: &gtk::SpinButton, tooltip: &str) -> gtk::Box {

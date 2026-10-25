@@ -189,6 +189,32 @@ The measure of the text, which says how wide a line of running text reaches,
 is the width of the widest line on the page. An entry of a list is short
 compared with it.
 
+## Readings and lookups
+
+The text that is recognised is Japanese, and Japanese is written without
+spaces between its words, so the text is much harder to read than it looks.
+Yomitan — the browser extension with the Japanese dictionaries — can say how
+each word is read, and what it means.
+
+**Show the readings**, in the settings, asks Yomitan for the readings and
+shows them with the text:
+
+```
+人気（にんき）のおかず　ポトフ
+```
+
+The readings come from Yomitan, so it has to be running for them to be had;
+the text that is copied is the plain text either way.
+
+**Look up**, in the toolbar, asks the dictionary about the words that are
+selected in the text, and shows what it says underneath.
+
+Yomitan has to be set up to answer requests from outside the browser. Its
+API is served on `http://127.0.0.1:19633`, and the guide for setting it up
+is in the [yomitan-api](https://github.com/Kuuuube/yomitan-api) project.
+The app asks the API over the network, so it is worth knowing that the
+requests go no further than the machine.
+
 ## What counts as new text
 
 Text that is still on screen gets recognised again on every frame, so it is

@@ -14,6 +14,7 @@ mod preview;
 mod region;
 mod settings;
 mod ui;
+mod yomitan;
 
 use std::io::Write;
 use std::path::PathBuf;
