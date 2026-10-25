@@ -42,6 +42,34 @@ cargo build --release
 
 The binary lands at `target/release/gnome-ocr`.
 
+### One file
+
+The app can be built into a single file that carries everything it needs:
+
+```bash
+bash scripts/package-appimage.sh
+```
+
+The result is `dist/gnome-ocr-x86_64.AppImage`. It carries the program, the
+engine that reads the screen, a python of its own, the libraries that engine
+needs, and the engine of Chrome that does the reading. It is checked as it is
+built: given a picture, the engine inside it says how much it read from it.
+
+The parts it is built from are found by looking, and can be named:
+
+| What | Where it is looked for | Named by |
+|---|---|---|
+| the qocr checkout | `~/Downloads/qocr` | `QOCR_SRC` |
+| the engine of Chrome | `~/.config/screen_ai` | `SCREEN_AI_DIR` |
+| the python to put in it | one of its own, through `uv` | `PYTHON` |
+| where the result goes | `./dist` | `OUT_DIR` |
+
+The program still needs the GTK libraries and a way to reach the screen from
+the machine it runs on, and both are there on any machine running GNOME.
+
+The program is built against the C library of the machine it was built on, so
+the bundle runs on that library and on anything newer.
+
 ## Run
 
 ```bash
@@ -191,9 +219,11 @@ By default the engine only reports Japanese text. To accept any language:
 
 The app looks for the daemon in this order:
 
-1. `~/.local/bin/qocrd`
-2. `./qocr/.venv/bin/qocrd` inside a qocr checkout
-3. `qocrd` on `PATH`
+1. `GNOME_OCR_QOCRD`, if it is set
+2. the copy next to the program, which is what a bundle carries
+3. `~/.local/bin/qocrd`
+4. `./qocr/.venv/bin/qocrd` inside a qocr checkout
+5. `qocrd` on `PATH`
 
 The qocr checkout needs the `scanfile` command, which accepts an existing
 image path:

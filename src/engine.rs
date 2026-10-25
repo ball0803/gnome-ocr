@@ -14,12 +14,34 @@ use anyhow::{Context, Result};
 use image::{ImageBuffer, ImageFormat, Rgba};
 use serde::Deserialize;
 
-/// Where the qocrd wrapper lives. First candidate that resolves wins.
+/// Where the qocrd wrapper lives when it is installed on the machine.
 const QOCRD_CANDIDATES: &[&str] = &[
     "/home/camel/.local/bin/qocrd",
     "/home/camel/Downloads/qocr/.venv/bin/qocrd",
     "qocrd",
 ];
+
+/// Where the qocrd wrapper may be, first candidate that resolves wins.
+///
+/// A bundle of the app carries its own copy of the engine next to the
+/// program, so that is looked for first, and the place can be named outright
+/// with GNOME_OCR_QOCRD.
+fn qocrd_candidates() -> Vec<PathBuf> {
+    qocrd_candidates_from(std::env::current_exe().ok().as_deref())
+}
+
+/// The same, for a program at a known place.
+fn qocrd_candidates_from(program: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(program) = std::env::var_os("GNOME_OCR_QOCRD") {
+        candidates.push(PathBuf::from(program));
+    }
+    if let Some(directory) = program.and_then(Path::parent) {
+        candidates.push(directory.join("qocrd"));
+    }
+    candidates.extend(QOCRD_CANDIDATES.iter().map(PathBuf::from));
+    candidates
+}
 
 #[derive(Debug, Deserialize)]
 struct ScanFileResponse {
@@ -153,22 +175,22 @@ struct Process {
 
 impl Process {
     fn spawn() -> Result<Self> {
-        let program = QOCRD_CANDIDATES
-            .iter()
-            .copied()
+        let program = qocrd_candidates()
+            .into_iter()
             .find(|candidate| resolve(candidate))
             .context(
-                "could not find qocrd; tried ~/.local/bin/qocrd, \
-                 the qocr virtualenv, and PATH",
+                "could not find qocrd; tried GNOME_OCR_QOCRD, the copy \
+                 next to this program, ~/.local/bin/qocrd, the qocr \
+                 virtualenv, and PATH",
             )?;
 
-        tracing::info!("starting qocrd from {program}");
-        let mut child = Command::new(program)
+        tracing::info!("starting qocrd from {}", program.display());
+        let mut child = Command::new(&program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| format!("spawn qocrd at {program}"))?;
+            .with_context(|| format!("spawn qocrd at {}", program.display()))?;
 
         let stdin = child.stdin.take().context("qocrd stdin")?;
         let stdout = child.stdout.take().context("qocrd stdout")?;
@@ -490,11 +512,11 @@ fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
-fn resolve(candidate: &str) -> bool {
-    if candidate == "qocrd" {
-        which(candidate).is_some()
+fn resolve(candidate: &Path) -> bool {
+    if candidate == Path::new("qocrd") {
+        which("qocrd").is_some()
     } else {
-        Path::new(candidate).is_file()
+        candidate.is_file()
     }
 }
 
@@ -549,6 +571,23 @@ fn mean_luma(rgba: &[u8]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// The engine that comes with a bundle of the app sits next to the
+    /// program, and is looked for before the ones on the machine.
+    #[test]
+    fn the_engine_next_to_the_program_is_looked_for_first() {
+        let program = Path::new("/somewhere/usr/bin/gnome-ocr");
+        let candidates = qocrd_candidates_from(Some(program));
+        assert_eq!(
+            candidates[0],
+            PathBuf::from("/somewhere/usr/bin/qocrd"),
+            "the copy next to the program comes first, got {candidates:?}"
+        );
+        assert!(
+            candidates.len() > 1,
+            "the ones on the machine are looked at as well"
+        );
+    }
+
     use super::*;
 
     /// Renders `text` to an opaque white image and returns it as RGBA8.
