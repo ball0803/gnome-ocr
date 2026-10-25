@@ -71,22 +71,74 @@ const CSS: &str = "
 }
 ";
 
+/// The kind of tag that says what part of speech the word is.
+///
+/// The dictionary says which kind each of its tags is, so that the word
+/// classes are told from the marks that say how common a word is.
+const WORD_CLASS: &str = "partOfSpeech";
+
 /// The word classes the dictionaries use, and the codes for them.
 ///
 /// A dictionary says what kind of word it is with a short code: `n` for a
 /// noun, `v1` for a verb of the first class, `adj-no` for an adjective
-/// that has the `na` form, and so on. These are the tags worth showing,
-/// because they say something about the word that the meaning does not.
+/// that has the `na` form, and so on.
 ///
 /// This is a list and not a pattern on purpose. The dictionaries also
 /// send frequency ranks and popularity marks — `ichi`, `news1k`, `⭐`,
 /// `★`, `1` — which look like codes but say nothing about the word, and
 /// no shape tells them apart from a word class.
-/// The kind of tag that says what part of speech the word is.
-///
-/// The dictionary says which kind each tag is, so the part of speech is found
-/// by that rather than by a list of names written out here.
-const WORD_CLASS: &str = "partOfSpeech";
+const WORD_CLASSES: &[&str] = &[
+    // The nouns, and the words that behave like them.
+    "n",
+    "n-adv",
+    "n-pref",
+    "ctr",
+    "exp",
+    "num",
+    "pron",
+    "unk",
+    // The verbs.
+    "v1",
+    "v1-s",
+    "v2",
+    "v3",
+    "v4",
+    "v5",
+    "v5r",
+    "v5k",
+    "v5u",
+    "v5s",
+    "vi",
+    "vt",
+    "vk",
+    "vz",
+    "vs",
+    "vs-i",
+    "vs-s",
+    "aux",
+    "aux-v",
+    "aux-adj",
+    // The adjectives.
+    "adj-i",
+    "adj-f",
+    "adj-na",
+    "adj-no",
+    "adj-ku",
+    "adj-ix",
+    "adj-shiku",
+    "adj-kari",
+    // The rest of the word classes.
+    "adv",
+    "adv-to",
+    "conj",
+    "cop",
+    "cop-da",
+    "int",
+    "interj",
+    "pref",
+    "suf",
+    "punct",
+];
 
 /// The card that shows what a word means.
 pub struct Card {
@@ -205,7 +257,7 @@ impl Card {
     }
 
     /// Whether the card is showing.
-    fn is_showing(&self) -> bool {
+    pub fn is_showing(&self) -> bool {
         self.showing.get()
     }
 
@@ -274,7 +326,7 @@ fn blocks(word: &str, reading: Option<&str>, entries: &[yomitan::Entry]) -> Vec<
         };
         let known = &mut words[number];
         known.meanings.extend(entry.definitions.iter().cloned());
-        for tag in entry.tags.iter().filter(|tag| tag.category == WORD_CLASS) {
+        for tag in entry.tags.iter().filter(|tag| is_word_class(tag)) {
             if !known.tags.contains(&tag.name) {
                 known.tags.push(tag.name.clone());
             }
@@ -312,11 +364,25 @@ fn blocks(word: &str, reading: Option<&str>, entries: &[yomitan::Entry]) -> Vec<
 
 /// Whether a tag says what kind of word it is, and is worth showing.
 ///
-/// The dictionaries send all sorts of tags with a word. The ones worth
-/// showing are the word classes, because they say something about the
-/// word that the meaning does not. The rest are noise: the frequency
-/// ranks of the dictionary, the marks that say how common a word is, and
-/// the empty tags that come with everything.
+/// The dictionaries send all sorts of tags with a word. The word classes
+/// — `n` for a noun, `v1` for a verb of the first class, `adj-no` for an
+/// adjective that has the `na` form — say what kind of word it is, and
+/// are worth showing. The rest are noise: the frequency ranks of the
+/// dictionary (`ichi`, `news1k`), the marks that say how common a word is
+/// (`⭐`, `★`, `1`), and the empty tags that come with everything.
+///
+/// The dictionary says which kind each tag is, so that is asked first. A
+/// tag that is one of the known word classes is kept as well, so that a
+/// word class is not lost when the dictionary does not say what kind a
+/// tag is.
+fn is_word_class(tag: &yomitan::Tag) -> bool {
+    let name = tag.name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    tag.category == WORD_CLASS || WORD_CLASSES.contains(&name)
+}
+
 /// The card as text, one line for each thing on it.
 ///
 /// The card is made of widgets, so that the tags can be pills and the
@@ -435,54 +501,61 @@ fn pixel(place: f64) -> Option<i32> {
 mod tests {
     use super::*;
 
+    /// A tag, as the dictionary would give it.
+    fn tag(name: &str, category: &str) -> yomitan::Tag {
+        yomitan::Tag {
+            name: name.to_owned(),
+            category: category.to_owned(),
+        }
+    }
+
     /// An entry, as the dictionary would give it.
-    ///
-    /// The tags are given with the kind the dictionary gives them, so that
-    /// the word classes can be told from the marks that say how common the
-    /// word is.
     fn entry(
         term: &str,
         reading: Option<&str>,
         definitions: &[&str],
-        tags: &[(&str, &str)],
+        tags: &[yomitan::Tag],
         dictionary: Option<&str>,
     ) -> yomitan::Entry {
         yomitan::Entry {
             term: term.to_owned(),
             reading: reading.map(str::to_owned),
             definitions: definitions.iter().map(|text| (*text).to_owned()).collect(),
-            tags: tags
-                .iter()
-                .map(|(name, category)| yomitan::Tag {
-                    name: (*name).to_owned(),
-                    category: (*category).to_owned(),
-                })
-                .collect(),
+            tags: tags.to_vec(),
             dictionary: dictionary.map(str::to_owned),
         }
     }
 
-    /// The word classes the dictionary gives, and the marks it gives beside
-    /// them.
     #[test]
-    fn the_word_classes_are_kept_and_the_marks_are_dropped() {
-        let entries = vec![entry(
-            "人気",
-            Some("にんき"),
-            &["popularity"],
-            &[
-                ("n", WORD_CLASS),
-                ("adj-no", WORD_CLASS),
-                ("⭐", "popular"),
-                ("ichi", "frequent"),
-                ("1", "default"),
-            ],
-            Some("JMdict"),
-        )];
+    fn the_word_classes_are_kept() {
+        for name in ["n", "adj-no", "v1"] {
+            assert!(
+                is_word_class(&tag(name, WORD_CLASS)),
+                "{name} says what kind of word it is"
+            );
+            assert!(
+                is_word_class(&tag(name, "")),
+                "{name} is a word class even when the dictionary does not say"
+            );
+        }
+    }
 
-        let words = blocks("人気", Some("にんき"), &entries);
-
-        assert_eq!(words[0].tags, ["n", "adj-no"]);
+    #[test]
+    fn the_marks_and_the_ranks_are_dropped() {
+        for (name, category) in [
+            ("", ""),
+            ("⭐", "popular"),
+            ("★", "popular"),
+            ("1", "frequency"),
+            ("2", "frequency"),
+            ("ichi", "frequent"),
+            ("news1k", "frequency"),
+        ] {
+            assert!(
+                !is_word_class(&tag(name, category)),
+                "{name} says nothing about the word"
+            );
+        }
     }
 
     #[test]
@@ -492,21 +565,21 @@ mod tests {
                 "人気",
                 Some("にんき"),
                 &["popularity"],
-                &[("n", WORD_CLASS)],
+                &[tag("n", WORD_CLASS)],
                 Some("JMdict"),
             ),
             entry(
-                    "犬",
-                    Some("いぬ"),
-                    &["a dog"],
-                    &[("n", WORD_CLASS)],
-                    Some("JMdict"),
-                ),
+                "犬",
+                Some("いぬ"),
+                &["a dog"],
+                &[tag("n", WORD_CLASS)],
+                Some("JMdict"),
+            ),
             entry(
                 "人気",
                 Some("にんき"),
                 &["a popular thing"],
-                &[("v5", WORD_CLASS)],
+                &[tag("v5", WORD_CLASS)],
                 Some("JMdict"),
             ),
         ];
@@ -527,17 +600,17 @@ mod tests {
     fn the_word_that_was_looked_at_comes_first() {
         let entries = vec![
             entry(
-                    "犬",
-                    Some("いぬ"),
-                    &["a dog"],
-                    &[("n", WORD_CLASS)],
-                    Some("JMdict"),
-                ),
+                "犬",
+                Some("いぬ"),
+                &["a dog"],
+                &[tag("n", WORD_CLASS)],
+                Some("JMdict"),
+            ),
             entry(
                 "人気",
                 Some("にんき"),
                 &["popularity"],
-                &[("n", WORD_CLASS)],
+                &[tag("n", WORD_CLASS)],
                 Some("JMdict"),
             ),
         ];
@@ -564,7 +637,7 @@ mod tests {
             "人気",
             Some("にんき"),
             &["popularity"],
-            &[("n", WORD_CLASS), ("ichi", "frequent")],
+            &[tag("n", WORD_CLASS), tag("ichi", "frequent")],
             Some("JMdict"),
         )];
 
