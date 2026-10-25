@@ -12,17 +12,28 @@
 //!
 //! # How the thresholds are worked out
 //!
-//! Every threshold here is a ratio of something measured from the page, and
-//! never an absolute size, which is the point of the document spectrum: the
-//! tolerances are multipliers of the spacings that the page itself shows.
+//! No threshold here is an absolute size, which is the point of the document
+//! spectrum: the tolerances are multipliers of the spacings that the page
+//! itself shows. There are two kinds, and they answer different questions.
 //!
-//! - The size of the ordinary text comes from the height that most of the
-//!   lines share.
-//! - Where one block ends and the next begins comes from the gaps between
-//!   the lines, split into a lower and an upper group by Otsu's method, the
-//!   same thresholding an image histogram uses.
-//! - The measure of the text, which says how wide a line of running text
-//!   reaches, is the width of the widest line on the page.
+//! The questions about the text itself are answered against the size of the
+//! text. The size of the ordinary text comes from the height that most of
+//! the lines share, and the tolerances are proportions of it: how far the
+//! left edges of a column may differ, how much space there may be between
+//! two lines of a paragraph, and how much the spacing of the entries of a
+//! list may change. They are proportions rather than sizes because the same
+//! page is read at different sizes, and because the same text is set with
+//! different amounts of space between the lines.
+//!
+//! The question about where one block ends and the next begins is answered
+//! against the page itself, from the gaps between the lines, split into a
+//! lower and an upper group by Otsu's method, the same thresholding an
+//! image histogram uses. That is the one that has to come from the page,
+//! because the gutters of a page are its own.
+//!
+//! The measure of the text, which says how wide a line of running text
+//! reaches, is the width of the widest line on the page. An entry of a list
+//! is short compared with it.
 //!
 //! The only number that is not a ratio is how many entries make a list,
 //! which is a definition rather than a tolerance: the list detection work
@@ -113,9 +124,25 @@ fn text_measure(lines: &[&Line]) -> f64 {
 /// How far the left edges of two lines may differ and still count as the
 /// same alignment, as a fraction of the height of the text.
 ///
-/// The text is the unit: a shift of half a line or less still reads as the
-/// same alignment, while a deeper indent is a different level.
-const ITEM_ALIGNMENT: f64 = 0.5;
+/// The lines of a column all begin at the same place, to within the width of
+/// the characters that begin them and the slack of the recogniser. A line
+/// set further along belongs to another column, while a deeper indent is a
+/// different level.
+const ITEM_ALIGNMENT: f64 = 0.6;
+
+/// The gap between two lines of one paragraph, as a fraction of the height
+/// of the text.
+///
+/// Running text is set with less space between its lines than the lines are
+/// tall, and a new paragraph is set with more.
+const PARAGRAPH_GAP: f64 = 0.75;
+
+/// How much the spacing between the entries of a list may change, as a
+/// fraction of the height of the text.
+///
+/// The entries of a list are evenly spaced, so the space between them is
+/// nearly the same each time.
+const ITEM_GAP: f64 = 0.8;
 
 /// How many items a run needs before it counts as a list.
 const MIN_LIST_ITEMS: usize = 3;
@@ -253,7 +280,6 @@ fn detect_runs(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let gaps = gaps_between(&ordered, lines);
     let threshold = threshold.unwrap_or(median_height);
 
     // Whether a line is an entry of its own. The engine's layout model knows
@@ -278,8 +304,23 @@ fn detect_runs(
             push_group(&mut run, groups);
             continue;
         }
-        if position > 0 && gaps[position - 1] > threshold {
-            push_group(&mut run, groups);
+        // The entries of a list are evenly spaced: the space between them
+        // may change, but not by more than the text is tall.
+        if run.len() >= 2 {
+            let previous = lines[run[run.len() - 1]];
+            let before = lines[run[run.len() - 2]];
+            let now = line.bounds.y - previous.bounds.bottom();
+            let was = previous.bounds.y - before.bounds.bottom();
+            if (now - was).abs() > ITEM_GAP * median_height {
+                push_group(&mut run, groups);
+            }
+        }
+        // A break on the page ends the list as well.
+        if let Some(last) = run.last() {
+            let previous = lines[*last];
+            if line.bounds.y - previous.bounds.bottom() > threshold {
+                push_group(&mut run, groups);
+            }
         }
         run.push(*index);
     }
@@ -645,7 +686,7 @@ fn order_horizontal(
         let mut paragraphs = Vec::new();
         for band in align_bands(&body, median_height) {
             let lines: Vec<&Line> = band.iter().map(|index| body[*index]).collect();
-            paragraphs.extend(group_by_geometry(&lines, median_height, threshold, clump));
+            paragraphs.extend(group_by_geometry(&lines, median_height, clump));
         }
         paragraphs
     };
@@ -836,7 +877,6 @@ fn group_by_block(lines: &[&Line], clump: bool) -> Vec<Paragraph> {
 fn group_by_geometry(
     lines: &[&Line],
     median_height: f64,
-    threshold: Option<f64>,
     clump: bool,
 ) -> Vec<Paragraph> {
     let mut sorted: Vec<&Line> = lines.to_vec();
@@ -847,10 +887,6 @@ fn group_by_geometry(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Where one block ends and the next begins is worked out from the gaps
-    // themselves, by splitting them into a lower and an upper group with
-    // Otsu's method. The lines that are close together are one block, and
-    // the ones that are further apart are not.
     let gaps: Vec<f64> = sorted
         .windows(2)
         .map(|pair| {
@@ -859,7 +895,6 @@ fn group_by_geometry(
             (lower - upper).max(0.0)
         })
         .collect();
-    let threshold = threshold.unwrap_or(median_height);
 
     let mut paragraphs: Vec<Paragraph> = Vec::new();
     let mut current: Vec<&Line> = Vec::new();
@@ -868,8 +903,12 @@ fn group_by_geometry(
     for (position, line) in sorted.iter().enumerate() {
         let continues = match (current_left, position) {
             (Some(left), position) if position > 0 => {
+                // Two lines are one paragraph when they line up on the left
+                // and the space between them is smaller than the text is
+                // tall: running text is set with less space between its
+                // lines than the lines are tall.
                 let same_edge = (line.bounds.x - left).abs() <= ITEM_ALIGNMENT * median_height;
-                same_edge && gaps[position - 1] <= threshold
+                same_edge && gaps[position - 1] <= PARAGRAPH_GAP * median_height
             }
             _ => false,
         };
@@ -1167,61 +1206,66 @@ mod tests {
     }
 
 
+    /// The lines of a real page, as the recogniser found them.
+    fn real_page() -> Vec<Line> {
+vec![
+        line("cookpad", 53.0, 17.0, 80.0, 18.0),
+        line("«", 233.0, 21.0, 16.0, 12.0),
+        line("Q", 24.0, 75.0, 20.0, 16.0),
+        line("さがす", 61.0, 75.0, 48.0, 18.0),
+        line("■ プレミアムサービス", 27.0, 127.0, 188.0, 20.0),
+        line("かぼちゃ", 304.9, 142.0, 58.1, 16.3),
+        line("「クリームチー", 572.0, 142.0, 101.0, 17.0),
+        line("里芋", 855.0, 139.8, 32.1, 16.2),
+        line("☆ パートナープログラム", 24.0, 179.0, 208.0, 19.0),
+        line("8 レシピチャレンジ", 26.0, 229.0, 171.0, 24.0),
+        line("小松菜", 304.0, 242.8, 45.1, 19.2),
+        line("国または地域", 60.0, 286.0, 103.0, 17.0),
+        line("人気のおかず", 297.0, 304.0, 103.0, 17.0),
+        line("きろく", 62.0, 338.0, 46.0, 14.0),
+        line("レシピの保存、レシピの作成をおこ", 24.0, 378.0, 214.0, 14.0),
+        line("なうにはログインしてください", 23.0, 398.0, 193.0, 13.0),
+        line("ポトフ", 304.0, 409.9, 46.0, 15.1),
+        line("ログイン", 1143.0, 14.5, 58.1, 17.5),
+        line("+ レシピを書く", 1252.0, 13.0, 110.2, 19.0),
+        line("ほうれん草", 855.0, 243.6, 77.1, 18.4),
+        line("ブロッコリー", 1131.0, 242.3, 89.1, 20.7),
+        line("おでん", 580.0, 409.7, 46.1, 15.3),
+        line("グラタン", 854.0, 406.5, 63.1, 19.5),
+        line("鍋", 1131.0, 408.0, 16.0, 16.0),
+        line("クラムチャウダー", 305.0, 513.0, 122.0, 16.0),
+        line("ンバーグ", 597.0, 510.9, 62.0, 16.1),
+        line("すきやき", 856.0, 513.0, 59.0, 13.2),
+        line("カテゴリ", 296.0, 569.0, 66.0, 18.0),
+        line("ロン", 317.0, 798.0, 21.0, 9.0),
+        line("野菜", 362.0, 633.0, 26.0, 14.0),
+        line("09", 595.0, 635.0, 18.0, 15.0),
+        line("お肉", 637.0, 633.0, 27.0, 14.0),
+        line("魚介", 913.0, 634.0, 27.0, 15.0),
+        line("サラダ", 362.0, 713.8, 41.1, 15.2),
+        line("たまご", 1188.0, 635.0, 39.0, 13.0),
+        line("スープ", 636.0, 713.0, 41.0, 13.0),
+        line("ごはんもの", 915.0, 712.9, 65.0, 14.1),
+        line("麵", 1186.0, 714.0, 15.0, 13.0),
+        line("お弁当", 361.0, 793.9, 41.0, 14.1),
+        line("パン", 636.0, 793.0, 27.0, 12.0),
+        line("人気のキーワード", 297.0, 905.0, 139.0, 19.0),
+        line("クックパッドのプレミアムサービス", 35.0, 955.0, 253.0, 18.0),
+        line("人気順検索や殿堂入りレシピなど、失敗知らずの人気レシピが見放題!", 35.0, 976.0, 495.0, 20.0),
+        line("カテゴリをもっと見る", 771.0, 861.0, 135.0, 14.0),
+        line("お菓子", 912.0, 793.0, 42.0, 16.0),
+        line("おもてなし", 1188.0, 795.0, 67.0, 13.0),
+        line("20:00 更新", 1325.0, 305.0, 57.0, 12.0),
+        line("20:00 更新", 1325.0, 907.9, 58.0, 12.1),
+        line("プレミアムサービスをはじめる", 1142.0, 967.0, 214.0, 16.0),
+]
+    }
+
     /// The menu of a real page, taken from an actual screen capture. The
     /// entries are short, share a left edge, and are indented in two levels.
     #[test]
     fn a_menu_of_a_real_page_is_found() {
-        let lines = vec![
-            line("cookpad", 53.0, 17.0, 80.0, 18.0),
-            line("«", 233.0, 21.0, 16.0, 12.0),
-            line("Q", 24.0, 75.0, 20.0, 16.0),
-            line("さがす", 61.0, 75.0, 48.0, 18.0),
-            line("■ プレミアムサービス", 27.0, 127.0, 188.0, 20.0),
-            line("かぼちゃ", 304.9, 142.0, 58.1, 16.3),
-            line("「クリームチー", 572.0, 142.0, 101.0, 17.0),
-            line("里芋", 855.0, 139.8, 32.1, 16.2),
-            line("☆ パートナープログラム", 24.0, 179.0, 208.0, 19.0),
-            line("8 レシピチャレンジ", 26.0, 229.0, 171.0, 24.0),
-            line("小松菜", 304.0, 242.8, 45.1, 19.2),
-            line("国または地域", 60.0, 286.0, 103.0, 17.0),
-            line("人気のおかず", 297.0, 304.0, 103.0, 17.0),
-            line("きろく", 62.0, 338.0, 46.0, 14.0),
-            line("レシピの保存、レシピの作成をおこ", 24.0, 378.0, 214.0, 14.0),
-            line("なうにはログインしてください", 23.0, 398.0, 193.0, 13.0),
-            line("ポトフ", 304.0, 409.9, 46.0, 15.1),
-            line("ログイン", 1143.0, 14.5, 58.1, 17.5),
-            line("+ レシピを書く", 1252.0, 13.0, 110.2, 19.0),
-            line("ほうれん草", 855.0, 243.6, 77.1, 18.4),
-            line("ブロッコリー", 1131.0, 242.3, 89.1, 20.7),
-            line("おでん", 580.0, 409.7, 46.1, 15.3),
-            line("グラタン", 854.0, 406.5, 63.1, 19.5),
-            line("鍋", 1131.0, 408.0, 16.0, 16.0),
-            line("クラムチャウダー", 305.0, 513.0, 122.0, 16.0),
-            line("ンバーグ", 597.0, 510.9, 62.0, 16.1),
-            line("すきやき", 856.0, 513.0, 59.0, 13.2),
-            line("カテゴリ", 296.0, 569.0, 66.0, 18.0),
-            line("ロン", 317.0, 798.0, 21.0, 9.0),
-            line("野菜", 362.0, 633.0, 26.0, 14.0),
-            line("09", 595.0, 635.0, 18.0, 15.0),
-            line("お肉", 637.0, 633.0, 27.0, 14.0),
-            line("魚介", 913.0, 634.0, 27.0, 15.0),
-            line("サラダ", 362.0, 713.8, 41.1, 15.2),
-            line("たまご", 1188.0, 635.0, 39.0, 13.0),
-            line("スープ", 636.0, 713.0, 41.0, 13.0),
-            line("ごはんもの", 915.0, 712.9, 65.0, 14.1),
-            line("麵", 1186.0, 714.0, 15.0, 13.0),
-            line("お弁当", 361.0, 793.9, 41.0, 14.1),
-            line("パン", 636.0, 793.0, 27.0, 12.0),
-            line("人気のキーワード", 297.0, 905.0, 139.0, 19.0),
-            line("クックパッドのプレミアムサービス", 35.0, 955.0, 253.0, 18.0),
-            line("人気順検索や殿堂入りレシピなど、失敗知らずの人気レシピが見放題!", 35.0, 976.0, 495.0, 20.0),
-            line("カテゴリをもっと見る", 771.0, 861.0, 135.0, 14.0),
-            line("お菓子", 912.0, 793.0, 42.0, 16.0),
-            line("おもてなし", 1188.0, 795.0, 67.0, 13.0),
-            line("20:00 更新", 1325.0, 305.0, 57.0, 12.0),
-            line("20:00 更新", 1325.0, 907.9, 58.0, 12.1),
-            line("プレミアムサービスをはじめる", 1142.0, 967.0, 214.0, 16.0),
-        ];
+        let lines = real_page();
 
         let layout = analyse(&lines, true, true);
 
@@ -1240,6 +1284,58 @@ mod tests {
         assert!(
             items.iter().any(|item| item.contains("プレミアムサービス")),
             "the menu should hold the entries, got {items:?}"
+        );
+    }
+
+    /// The text of a real page keeps the breaks the page has, and a break is
+    /// marked with an ideographic space.
+    #[test]
+    fn the_text_of_a_real_page_keeps_its_breaks() {
+        let lines = real_page();
+        let layout = analyse(&lines, true, true);
+        let fresh = (0..layout.blocks.len())
+            .map(|index| crate::layout::Fresh {
+                block: layout.blocks[index].clone(),
+                new_paragraph: layout.starts_paragraph(index),
+            })
+            .collect::<Vec<_>>();
+        let text = crate::layout::join_blocks(&fresh);
+
+        assert!(
+            text.contains("プレミアムサービス"),
+            "the text should hold what the page said, got {text:?}"
+        );
+        assert!(
+            text.contains('\u{3000}'),
+            "the break should be marked with an ideographic space, got {text:?}"
+        );
+
+        // The two lines of one wrapped sentence are one paragraph.
+        assert!(
+            text.contains("レシピの保存、レシピの作成をおこ なうにはログインしてください"),
+            "the wrapped sentence should be one paragraph, got {text:?}"
+        );
+
+        // The lists of the page are found: the menu, and the five columns of
+        // categories under it.
+        let lists: Vec<Vec<String>> = layout
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                crate::layout::Block::List { items, .. } => Some(items.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lists.len(), 6, "the page should hold six lists, got {lists:?}");
+        assert!(
+            lists[0].iter().any(|item| item.contains("プレミアムサービス")),
+            "the first list should be the menu, got {lists:?}"
+        );
+        assert!(
+            lists.iter().any(|items| {
+                items.len() == 3 && items[0] == "人気のおかず" && items[2] == "クラムチャウダー"
+            }),
+            "the column of dishes should be a list, got {lists:?}"
         );
     }
 
@@ -1271,8 +1367,8 @@ mod tests {
         assert_eq!(lists(&apart), 0, "the menu should not be gathered");
     }
 
-    /// A large gap between two blocks leaves a blank line in the text, so
-    /// that the break on the page is kept.
+    /// A large gap between two blocks leaves an ideographic space in the
+    /// text, so that the break on the page is kept.
     #[test]
     fn a_large_gap_leaves_a_blank_line_in_the_text() {
         let mut first = line("above", 60.0, 100.0, 200.0, 20.0);

@@ -136,15 +136,21 @@ Where the page has a large gap between two pieces of text, the break is kept
 and the next piece is set out with an ideographic space, which is how a
 paragraph is marked in Japanese.
 
-Every threshold used for this is a ratio of something measured from the page
-itself, never an absolute size: the size of the ordinary text comes from the
-height most of the lines share, the gap that sets one block apart from the
-next comes from splitting the gaps between the lines into a lower and an
-upper group, and the measure of the text, which says how wide a line of
-running text reaches, is the width of the widest line on the page.
+No threshold used for this is an absolute size. The questions about the text
+itself are answered against the size of the ordinary text, which comes from
+the height that most of the lines share: how far the left edges of a column
+may differ, how much space there may be between two lines of a paragraph,
+and how much the spacing of the entries of a list may change are all
+proportions of it, so they hold at any resolution.
 
-The thresholds are all relative to the size of the ordinary text, so they
-hold at any resolution.
+The question of where one block ends and the next begins is answered against
+the page itself, from the gaps between the lines, split into a lower and an
+upper group. That one has to come from the page, because the gutters of a
+page are its own.
+
+The measure of the text, which says how wide a line of running text reaches,
+is the width of the widest line on the page. An entry of a list is short
+compared with it.
 
 ## What counts as new text
 
