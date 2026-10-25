@@ -381,8 +381,6 @@ enum Asking {
     Readings { piece: usize, text: String },
     /// The dictionary entries for the words that were selected in the text.
     Selected { text: String },
-    /// The dictionary entries for the word the pointer is over.
-    Pointed { text: String },
 }
 
 /// What came back.
@@ -460,17 +458,6 @@ impl Reader {
                             pointed: false,
                         });
                     }
-                    Asking::Pointed { text } => {
-                        let Ok(entries) = crate::yomitan::entries(&text) else {
-                            let _ = done.try_send(Answer::Failed);
-                            continue;
-                        };
-                        let _ = done.try_send(Answer::Entries {
-                            text,
-                            entries,
-                            pointed: true,
-                        });
-                    }
                 }
             }
         });
@@ -513,9 +500,6 @@ struct Window {
     /// Whether the word under the pointer has been looked up since it last
     /// moved.
     scanned: Cell<bool>,
-    /// The word that was looked up last, so that it is not asked about again
-    /// while the pointer stays over it.
-    looked_up: RefCell<Option<String>>,
     /// What is under the pointer, so that a pointer which only jitters is
     /// taken to be still.
     under: RefCell<Option<String>>,
@@ -763,7 +747,6 @@ impl Window {
             over_text: Cell::new(false),
             last_moved: Cell::new(0.0),
             scanned: Cell::new(false),
-            looked_up: RefCell::new(None),
             under: RefCell::new(None),
             settings: settings.clone(),
             copy_button,
@@ -1604,15 +1587,10 @@ impl Window {
             let Some((word, range)) = self.word_at(offset) else {
                 return;
             };
-            // The word is selected, as if it had been dragged over.
+            // The word is selected, as if it had been dragged over. That is
+            // all that happens: the dictionary is asked when the user asks.
             self.select(range);
-            // And it is looked up, but only when it is a different word.
-            if self.looked_up.borrow().as_deref() == Some(word.as_str()) {
-                return;
-            }
-            *self.looked_up.borrow_mut() = Some(word.clone());
             tracing::debug!("the word under the pointer is {word:?}");
-            let _ = self.reader.jobs.try_send(Asking::Pointed { text: word });
             return;
         }
 
@@ -1635,12 +1613,7 @@ impl Window {
             self.card.hide();
             return;
         }
-        if self.looked_up.borrow().as_deref() == Some(text.as_str()) {
-            return;
-        }
-        *self.looked_up.borrow_mut() = Some(text.clone());
         tracing::debug!("the word under the pointer is {text:?}");
-        let _ = self.reader.jobs.try_send(Asking::Pointed { text });
     }
 
     /// Selects a word in the text, so that it is clear which word is being

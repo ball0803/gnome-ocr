@@ -215,21 +215,22 @@ would have been.
 ### Looking up a word under the pointer
 
 Hold the **scan modifier key** and move the pointer over a word in the
-preview, and the word under it is looked up and the card appears beside the
-pointer. This is how Yomitan works on a web page, and the app does the same
-over the screen it is capturing.
+text, and the word is selected, as if it had been dragged over. That is
+all that happens: nothing is asked of the dictionary while the pointer is
+moving.
 
-Two settings control it, both in the settings:
+To see what the word means, press **Look up**, and the card shows it.
+
+Two settings control the scanning, both in the settings:
 
 | Setting | What it does |
 |---|---|
-| Scan modifier key | The key that has to be held down while the pointer moves. Without it, moving the pointer over the preview asks for nothing. |
-| Scan delay | How long the pointer has to rest over a word, in milliseconds, before it is looked up. |
+| Scan modifier key | The key that has to be held down while the pointer moves. Without it, moving the pointer over the text changes nothing. |
+| Scan delay | How long the pointer has to rest over a word, in milliseconds, before it is selected. |
 
-The word is found from where the recogniser said it was, so nothing is read
-again for it, and the pointer has to rest before anything is asked, so that
-sweeping the pointer across the screen does not fill the dictionary's
-attention.
+The words are worked out once, when the text arrives, so the pointer over
+it is answered at once and the dictionary is not asked again while the
+pointer stays over the same word.
 
 Yomitan has to be set up to answer requests from outside the browser. Its
 API is served on `http://127.0.0.1:19633`, and the guide for setting it up
