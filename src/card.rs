@@ -65,6 +65,11 @@ const CSS: &str = "
     font-size: 0.8em;
 }
 
+.card-note {
+    color: @error_color;
+    font-size: 0.95em;
+}
+
 .card-dictionary {
     color: @theme_unfocused_fg_color;
     font-size: 0.8em;
@@ -222,6 +227,33 @@ impl Card {
         let text = card_text(&words);
         self.content.update_property(&[gtk::accessible::Property::Description(&text)]);
 
+        self.place(parent);
+        tracing::debug!("the card shows {word}");
+    }
+
+    /// Shows that the dictionary could not be asked.
+    ///
+    /// The card says it, so that the reason is where the answer would have
+    /// been, rather than only in a line at the bottom of the window.
+    pub fn show_message(&self, parent: &impl IsA<gtk::Widget>, message: &str) {
+        while let Some(child) = self.content.first_child() {
+            self.content.remove(&child);
+        }
+        let label = gtk::Label::new(Some(message));
+        label.set_xalign(0.0);
+        label.set_wrap(true);
+        label.set_selectable(true);
+        label.add_css_class("card-note");
+        self.content.append(&label);
+        self.content
+            .update_property(&[gtk::accessible::Property::Description(message)]);
+
+        self.place(parent);
+        tracing::debug!("the card says: {message}");
+    }
+
+    /// Puts the card beside the pointer and shows it.
+    fn place(&self, parent: &impl IsA<gtk::Widget>) {
         let Some(window) = parent.root() else {
             tracing::warn!("the card has no window to sit in");
             return;
@@ -240,7 +272,6 @@ impl Card {
         }
         self.popover.popup();
         self.showing.set(true);
-        tracing::debug!("the card shows {word}");
     }
 
     /// Takes the card away.

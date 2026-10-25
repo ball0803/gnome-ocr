@@ -1207,10 +1207,19 @@ impl Window {
                         pointed,
                         range,
                     } => owner.show_entries(pointed, range, &text, &entries),
-                    Answer::Failed => owner.set_status(
-                        "Yomitan is not answering. It has to be running, with the API \
-                         turned on, for the readings and the lookups.",
-                    ),
+                    Answer::Failed => {
+                        // The card says it, because that is where the answer
+                        // would have been.
+                        owner.card.show_message(
+                            &owner.canvas,
+                            "Yomitan is not answering. It has to be running, with the API \
+                             turned on, for the readings and the lookups.",
+                        );
+                        owner.set_status(
+                            "Yomitan is not answering. It has to be running, with the API \
+                             turned on, for the readings and the lookups.",
+                        );
+                    }
                 }
             }
         });

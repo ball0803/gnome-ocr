@@ -209,6 +209,9 @@ the text that is copied is the plain text either way.
 **Look up**, in the toolbar, asks the dictionary about the words that are
 selected in the text, and shows what it says in a card.
 
+If Yomitan is not answering, the card says so, in the place where the answer
+would have been.
+
 ### Looking up a word under the pointer
 
 Hold the **scan modifier key** and move the pointer over a word in the
