@@ -116,7 +116,8 @@ pub struct Line {
 /// The measure of the text: the width of the widest line on the page.
 ///
 /// A line of running text reaches the measure, because it is wrapped to it.
-/// An entry of a list does not, so it is short compared with the measure.
+/// An entry of a list does not: it is short compared with the measure, and
+/// does not reach half of it.
 fn text_measure(lines: &[&Line]) -> f64 {
     lines
         .iter()
@@ -293,7 +294,9 @@ fn detect_runs(
                 None => true,
             }
         } else {
-            line.bounds.width * 2.0 <= measure
+            // An entry of a list is short: it does not reach half of the
+            // measure of the text.
+            line.bounds.width <= measure / 2.0
         };
         if !is_entry {
             push_group(&mut run, groups);
