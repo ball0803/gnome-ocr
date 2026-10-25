@@ -122,6 +122,10 @@ document analysis literature does it:
   text tells the level
 - lines that run downwards, which is how Japanese is often written, are kept
   apart and read from the right
+- runs of short entries that share a left edge and are evenly spaced are
+  gathered into one list, which is how the entries of a menu are kept
+  together. An entry that is indented further along is at a different level
+  and starts a list of its own
 
 The thresholds are all relative to the size of the ordinary text, so they
 hold at any resolution.

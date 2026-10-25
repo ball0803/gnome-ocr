@@ -314,12 +314,14 @@ impl ListEntry {
     /// Adds more text to the entry and shows the newest frame.
     fn append(&self, text: &str, image: Option<Vec<u8>>) {
         if !text.is_empty() {
-            let label = gtk::Label::new(Some(text));
-            label.set_xalign(0.0);
-            label.set_yalign(0.0);
-            label.set_wrap(true);
-            label.set_selectable(true);
-            self.content.append(&label);
+            for line in text.split('\n') {
+                let label = gtk::Label::new(Some(line));
+                label.set_xalign(0.0);
+                label.set_yalign(0.0);
+                label.set_wrap(true);
+                label.set_selectable(true);
+                self.content.append(&label);
+            }
         }
         if let Some(png) = image
             && let Ok(texture) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(png))
@@ -1200,6 +1202,15 @@ fn section_of(
                 }
                 crate::layout::Block::Paragraph { text, .. } => {
                     if section.paragraphs.iter().any(|paragraph| paragraph == text) {
+                        return section.heading.clone();
+                    }
+                }
+                crate::layout::Block::List { items, .. } => {
+                    if section
+                        .paragraphs
+                        .iter()
+                        .any(|paragraph| items.iter().any(|item| item == paragraph))
+                    {
                         return section.heading.clone();
                     }
                 }

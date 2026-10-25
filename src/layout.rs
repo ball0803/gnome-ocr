@@ -80,6 +80,141 @@ pub struct Line {
     pub block_id: i64,
 }
 
+
+/// The longest text an item of a list may have. The entries of a menu are
+/// short; a paragraph of running text is not.
+const MAX_ITEM_CHARS: usize = 24;
+
+/// How far the left edges of the items of a list may differ, as a fraction
+/// of the height of the text. The entries of a menu line up, and an entry
+/// that is indented belongs to a different level.
+const ITEM_ALIGNMENT: f64 = 0.6;
+
+/// How much the gaps between the items of a list may differ, as a fraction
+/// of the height of the text.
+const ITEM_GAP: f64 = 0.8;
+
+/// How many items a run needs before it counts as a list.
+const MIN_LIST_ITEMS: usize = 3;
+
+/// Finds the runs of lines that are a list: short entries that line up and
+/// are spaced evenly.
+///
+/// This is the rule the layout analysis literature uses. The entries of a
+/// menu are short, share a left edge, and are separated by even gaps, and
+/// the gap that sets a list apart from what is around it is larger. An
+/// entry that is indented further along is at a different level, so it
+/// starts a list of its own.
+///
+/// The lines are first put into bands by their left edge. The entries of a
+/// menu sit at the same height as the entries of the column beside them, so
+/// looking at the page as it comes would never find two of them together.
+fn detect_lists(lines: &[&Line], median_height: f64) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for band in align_bands(lines, median_height) {
+        detect_runs(&band, lines, median_height, &mut groups);
+    }
+    groups
+}
+
+/// Puts the lines into bands that share a left edge.
+///
+/// A column of text, and the entries of a menu, all line up on the left. The
+/// entries of two columns sit at the same height as one another, so the bands
+/// are what keep the two apart.
+fn align_bands(lines: &[&Line], median_height: f64) -> Vec<Vec<usize>> {
+    let mut by_edge: Vec<usize> = (0..lines.len()).collect();
+    by_edge.sort_by(|a, b| {
+        lines[*a]
+            .bounds
+            .x
+            .partial_cmp(&lines[*b].bounds.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut bands: Vec<Vec<usize>> = Vec::new();
+    let mut band: Vec<usize> = Vec::new();
+
+    for index in by_edge {
+        let edge = lines[index].bounds.x;
+        let same_band = match band.first() {
+            Some(first) => {
+                (edge - lines[*first].bounds.x).abs() <= ITEM_ALIGNMENT * median_height
+            }
+            None => true,
+        };
+        if same_band {
+            band.push(index);
+        } else {
+            bands.push(std::mem::take(&mut band));
+            band.push(index);
+        }
+    }
+    if !band.is_empty() {
+        bands.push(band);
+    }
+
+    bands
+}
+
+/// Finds the evenly spaced runs within one band of aligned lines.
+fn detect_runs(
+    band: &[usize],
+    lines: &[&Line],
+    median_height: f64,
+    groups: &mut Vec<Vec<usize>>,
+) {
+    let mut ordered: Vec<usize> = band.to_vec();
+    ordered.sort_by(|a, b| {
+        lines[*a]
+            .bounds
+            .y
+            .partial_cmp(&lines[*b].bounds.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut run: Vec<usize> = Vec::new();
+    for index in ordered {
+        let line = lines[index];
+        if line.text.chars().count() > MAX_ITEM_CHARS {
+            push_group(&mut run, groups);
+            continue;
+        }
+        if run.len() >= 2 {
+            let previous = lines[run[run.len() - 1]];
+            let before = lines[run[run.len() - 2]];
+            let now = line.bounds.y - previous.bounds.bottom();
+            let was = previous.bounds.y - before.bounds.bottom();
+            if (now - was).abs() > ITEM_GAP * median_height {
+                push_group(&mut run, groups);
+            }
+        }
+        run.push(index);
+    }
+    push_group(&mut run, groups);
+}
+
+/// Keeps a run of lines if it is long enough to be a list.
+fn push_group(run: &mut Vec<usize>, groups: &mut Vec<Vec<usize>>) {
+    if run.len() >= MIN_LIST_ITEMS {
+        groups.push(run.clone());
+    }
+    run.clear();
+}
+
+/// Builds a list out of a run of lines.
+fn make_list(lines: &[&Line]) -> (Vec<String>, Rect) {
+    let items = lines.iter().map(|line| line_text(line)).collect::<Vec<_>>();
+    let bounds = Rect::union(&lines.iter().map(|line| line.bounds).collect::<Vec<_>>())
+        .unwrap_or(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        });
+    (items, bounds)
+}
+
 /// A piece of the text, in reading order.
 #[derive(Debug, Clone)]
 pub enum Block {
@@ -91,18 +226,26 @@ pub enum Block {
     },
     /// A run of lines that belong together.
     Paragraph { text: String, bounds: Rect },
+    /// A run of short, aligned items that belong together, such as the
+    /// entries of a menu.
+    List { items: Vec<String>, bounds: Rect },
 }
 
 impl Block {
-    pub fn text(&self) -> &str {
+    /// The text of the block. The items of a list are shown together, since
+    /// they are one unit of the page.
+    pub fn text(&self) -> String {
         match self {
-            Block::Heading { text, .. } | Block::Paragraph { text, .. } => text,
+            Block::Heading { text, .. } | Block::Paragraph { text, .. } => text.clone(),
+            Block::List { items, .. } => items.join(" "),
         }
     }
 
     pub fn bounds(&self) -> Rect {
         match self {
-            Block::Heading { bounds, .. } | Block::Paragraph { bounds, .. } => *bounds,
+            Block::Heading { bounds, .. }
+            | Block::Paragraph { bounds, .. }
+            | Block::List { bounds, .. } => *bounds,
         }
     }
 }
@@ -133,6 +276,11 @@ impl Layout {
                     };
                 }
                 Block::Paragraph { text, .. } => current.paragraphs.push(text.clone()),
+                Block::List { items, .. } => {
+                    for item in items {
+                        current.paragraphs.push(item.clone());
+                    }
+                }
             }
         }
         if current.has_content() {
@@ -187,6 +335,23 @@ const HEADING_RATIO: f64 = 1.25;
 
 /// The levels a heading can have, from the largest.
 const HEADING_LEVELS: [(f64, u8); 3] = [(2.0, 1), (1.5, 2), (1.25, 3)];
+
+/// Something with a place on the page.
+trait Placed {
+    fn bounds(&self) -> Rect;
+}
+
+impl Placed for &Line {
+    fn bounds(&self) -> Rect {
+        self.bounds
+    }
+}
+
+impl Placed for Item {
+    fn bounds(&self) -> Rect {
+        self.bounds
+    }
+}
 
 /// A block of text waiting to be placed.
 #[derive(Debug, Clone)]
@@ -263,9 +428,43 @@ fn order_horizontal(lines: &[&Line], median_height: f64, clump: bool) -> Vec<Blo
         return Vec::new();
     }
 
+    // The lines of a page arrive in no order at all, and the entries of a
+    // menu sit at the same height as the entries of the column beside it.
+    // The lists are found from where the lines are, so they are put in place
+    // first.
+    let mut sorted: Vec<&Line> = lines.to_vec();
+    sorted.sort_by(|a, b| {
+        a.bounds
+            .y
+            .partial_cmp(&b.bounds.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                a.bounds
+                    .x
+                    .partial_cmp(&b.bounds.x)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+
+    // The runs of short, aligned lines are a list, such as the entries of a
+    // menu, and are kept together as one block.
+    let groups = detect_lists(&sorted, median_height);
+    let mut listed = vec![false; sorted.len()];
+    for group in &groups {
+        for index in group {
+            listed[*index] = true;
+        }
+    }
+
+    // An entry of a list is not a heading, even when it is taller than the
+    // text around it. The entries of a menu often carry an icon and are
+    // taller than the body text of the page.
     let mut headings: Vec<Item> = Vec::new();
     let mut body: Vec<&Line> = Vec::new();
-    for line in lines {
+    for (index, line) in sorted.iter().enumerate() {
+        if listed[index] {
+            continue;
+        }
         match heading_level(line.bounds.height, median_height) {
             Some(level) => headings.push(Item {
                 block: Block::Heading {
@@ -279,7 +478,21 @@ fn order_horizontal(lines: &[&Line], median_height: f64, clump: bool) -> Vec<Blo
         }
     }
 
-    let paragraphs = group_paragraphs(&body, median_height, clump);
+    // The paragraphs. The engine's grouping comes first, because it knows
+    // things the geometry does not, such as a paragraph whose first line is
+    // indented. When the engine has grouped nothing, the lines are grouped
+    // within their band, so that two columns stay apart.
+    let paragraphs = if body.iter().any(|line| line.block_id != 0) {
+        group_by_block(&body, clump)
+    } else {
+        let mut paragraphs = Vec::new();
+        for band in align_bands(&body, median_height) {
+            let lines: Vec<&Line> = band.iter().map(|index| body[*index]).collect();
+            paragraphs.extend(group_by_geometry(&lines, median_height, clump));
+        }
+        paragraphs
+    };
+
     let mut items: Vec<Item> = paragraphs
         .into_iter()
         .map(|paragraph| Item {
@@ -290,7 +503,22 @@ fn order_horizontal(lines: &[&Line], median_height: f64, clump: bool) -> Vec<Blo
             },
         })
         .collect();
-    items.extend(headings);
+
+    for group in &groups {
+        let lines: Vec<&Line> = group.iter().map(|index| sorted[*index]).collect();
+        let (entries, bounds) = make_list(&lines);
+        items.push(Item {
+            bounds,
+            block: Block::List {
+                items: entries,
+                bounds,
+            },
+        });
+    }
+
+    for heading in headings {
+        items.push(heading);
+    }
 
     place_items(items, median_height)
 }
@@ -402,18 +630,6 @@ struct Paragraph {
 /// paragraph whose first line is indented. It is used when it has grouped
 /// anything at all; otherwise the lines are grouped by their left edge and
 /// the gap between them.
-fn group_paragraphs(lines: &[&Line], median_height: f64, clump: bool) -> Vec<Paragraph> {
-    // The engine numbers the blocks it found, starting at zero. If every
-    // line is in block zero then it has not grouped anything, and the
-    // geometry is all there is to go on.
-    let grouped = lines.iter().any(|line| line.block_id != 0);
-    if grouped {
-        return group_by_block(lines, clump);
-    }
-
-    group_by_geometry(lines, median_height, clump)
-}
-
 /// Groups the lines by the block the engine put them in.
 fn group_by_block(lines: &[&Line], clump: bool) -> Vec<Paragraph> {
     let mut order: Vec<i64> = Vec::new();
@@ -535,14 +751,19 @@ fn heading_level(height: f64, median_height: f64) -> Option<u8> {
 /// Cuts the items up recursively to find the reading order.
 ///
 /// Each leaf is one column, and the columns come out in reading order.
-fn cut_into_columns(items: &[Item], median_height: f64) -> Vec<Vec<Item>> {
+fn cut_into_columns<T: Placed + Clone>(items: &[T], median_height: f64) -> Vec<Vec<T>> {
     let mut columns = Vec::new();
     cut(items, median_height, &mut columns, 0);
     columns
 }
 
 /// One step of the cutting.
-fn cut(items: &[Item], median_height: f64, columns: &mut Vec<Vec<Item>>, depth: usize) {
+fn cut<T: Placed + Clone>(
+    items: &[T],
+    median_height: f64,
+    columns: &mut Vec<Vec<T>>,
+    depth: usize,
+) {
     if items.is_empty() {
         return;
     }
@@ -572,21 +793,22 @@ fn cut(items: &[Item], median_height: f64, columns: &mut Vec<Vec<Item>>, depth: 
 }
 
 /// Splits the items in two along an axis.
-fn split(
-    items: &[Item],
+fn split<T: Placed + Clone>(
+    items: &[T],
     position: f64,
     axis: Axis,
     median_height: f64,
-    columns: &mut Vec<Vec<Item>>,
+    columns: &mut Vec<Vec<T>>,
     depth: usize,
 ) {
-    let (first, second): (Vec<Item>, Vec<Item>) = items
+    let (first, second): (Vec<T>, Vec<T>) = items
         .iter()
         .cloned()
         .partition(|item| {
+            let bounds = item.bounds();
             let middle = match axis {
-                Axis::X => item.bounds.x + item.bounds.width / 2.0,
-                Axis::Y => item.bounds.y + item.bounds.height / 2.0,
+                Axis::X => bounds.x + bounds.width / 2.0,
+                Axis::Y => bounds.y + bounds.height / 2.0,
             };
             middle < position
         });
@@ -602,12 +824,15 @@ enum Axis {
 }
 
 /// The widest gap between the blocks along an axis, and where it is.
-fn widest_gap(items: &[Item], axis: Axis) -> Option<(f64, f64)> {
+fn widest_gap<T: Placed>(items: &[T], axis: Axis) -> Option<(f64, f64)> {
     let mut spans: Vec<(f64, f64)> = items
         .iter()
-        .map(|item| match axis {
-            Axis::X => (item.bounds.x, item.bounds.right()),
-            Axis::Y => (item.bounds.y, item.bounds.bottom()),
+        .map(|item| {
+            let bounds = item.bounds();
+            match axis {
+                Axis::X => (bounds.x, bounds.right()),
+                Axis::Y => (bounds.y, bounds.bottom()),
+            }
         })
         .collect();
     if spans.is_empty() {
@@ -670,7 +895,7 @@ mod tests {
         }
     }
 
-    fn texts(blocks: &[Block]) -> Vec<&str> {
+    fn texts(blocks: &[Block]) -> Vec<String> {
         blocks.iter().map(Block::text).collect()
     }
 
@@ -734,6 +959,83 @@ mod tests {
                 "The sentence that was wrapped over two lines",
                 "A separate label"
             ]
+        );
+    }
+
+
+    /// The menu of a real page, taken from an actual screen capture. The
+    /// entries are short, share a left edge, and are indented in two levels.
+    #[test]
+    fn a_menu_of_a_real_page_is_found() {
+        let lines = vec![
+            line("cookpad", 53.0, 17.0, 80.0, 18.0),
+            line("«", 233.0, 21.0, 16.0, 12.0),
+            line("Q", 24.0, 75.0, 20.0, 16.0),
+            line("さがす", 61.0, 75.0, 48.0, 18.0),
+            line("■ プレミアムサービス", 27.0, 127.0, 188.0, 20.0),
+            line("かぼちゃ", 304.9, 142.0, 58.1, 16.3),
+            line("「クリームチー", 572.0, 142.0, 101.0, 17.0),
+            line("里芋", 855.0, 139.8, 32.1, 16.2),
+            line("☆ パートナープログラム", 24.0, 179.0, 208.0, 19.0),
+            line("8 レシピチャレンジ", 26.0, 229.0, 171.0, 24.0),
+            line("小松菜", 304.0, 242.8, 45.1, 19.2),
+            line("国または地域", 60.0, 286.0, 103.0, 17.0),
+            line("人気のおかず", 297.0, 304.0, 103.0, 17.0),
+            line("きろく", 62.0, 338.0, 46.0, 14.0),
+            line("レシピの保存、レシピの作成をおこ", 24.0, 378.0, 214.0, 14.0),
+            line("なうにはログインしてください", 23.0, 398.0, 193.0, 13.0),
+            line("ポトフ", 304.0, 409.9, 46.0, 15.1),
+            line("ログイン", 1143.0, 14.5, 58.1, 17.5),
+            line("+ レシピを書く", 1252.0, 13.0, 110.2, 19.0),
+            line("ほうれん草", 855.0, 243.6, 77.1, 18.4),
+            line("ブロッコリー", 1131.0, 242.3, 89.1, 20.7),
+            line("おでん", 580.0, 409.7, 46.1, 15.3),
+            line("グラタン", 854.0, 406.5, 63.1, 19.5),
+            line("鍋", 1131.0, 408.0, 16.0, 16.0),
+            line("クラムチャウダー", 305.0, 513.0, 122.0, 16.0),
+            line("ンバーグ", 597.0, 510.9, 62.0, 16.1),
+            line("すきやき", 856.0, 513.0, 59.0, 13.2),
+            line("カテゴリ", 296.0, 569.0, 66.0, 18.0),
+            line("ロン", 317.0, 798.0, 21.0, 9.0),
+            line("野菜", 362.0, 633.0, 26.0, 14.0),
+            line("09", 595.0, 635.0, 18.0, 15.0),
+            line("お肉", 637.0, 633.0, 27.0, 14.0),
+            line("魚介", 913.0, 634.0, 27.0, 15.0),
+            line("サラダ", 362.0, 713.8, 41.1, 15.2),
+            line("たまご", 1188.0, 635.0, 39.0, 13.0),
+            line("スープ", 636.0, 713.0, 41.0, 13.0),
+            line("ごはんもの", 915.0, 712.9, 65.0, 14.1),
+            line("麵", 1186.0, 714.0, 15.0, 13.0),
+            line("お弁当", 361.0, 793.9, 41.0, 14.1),
+            line("パン", 636.0, 793.0, 27.0, 12.0),
+            line("人気のキーワード", 297.0, 905.0, 139.0, 19.0),
+            line("クックパッドのプレミアムサービス", 35.0, 955.0, 253.0, 18.0),
+            line("人気順検索や殿堂入りレシピなど、失敗知らずの人気レシピが見放題!", 35.0, 976.0, 495.0, 20.0),
+            line("カテゴリをもっと見る", 771.0, 861.0, 135.0, 14.0),
+            line("お菓子", 912.0, 793.0, 42.0, 16.0),
+            line("おもてなし", 1188.0, 795.0, 67.0, 13.0),
+            line("20:00 更新", 1325.0, 305.0, 57.0, 12.0),
+            line("20:00 更新", 1325.0, 907.9, 58.0, 12.1),
+            line("プレミアムサービスをはじめる", 1142.0, 967.0, 214.0, 16.0),
+        ];
+
+        let layout = analyse(&lines, true);
+
+        // The entries of the menu come out as one list.
+        let lists: Vec<&Vec<String>> = layout
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                crate::layout::Block::List { items, .. } => Some(items),
+                _ => None,
+            })
+            .collect();
+        assert!(!lists.is_empty(), "the menu should have been found");
+
+        let items = &lists[0];
+        assert!(
+            items.iter().any(|item| item.contains("プレミアムサービス")),
+            "the menu should hold the entries, got {items:?}"
         );
     }
 
