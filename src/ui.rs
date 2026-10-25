@@ -854,10 +854,18 @@ impl Window {
         // be looked up once it has rested there.
         let motion = gtk::EventControllerMotion::new();
         let owner = Rc::clone(self);
-        motion.connect_motion(move |controller, x, y| {
-            owner.pointer_moved(x, y, controller.current_event_state());
+        motion.connect_motion(move |_controller, x, y| {
+            owner.pointer_moved(x, y, gdk::ModifierType::empty());
         });
         self.canvas.add_controller(motion);
+
+        if let Some(pointer) = gdk::Display::default()
+            .and_then(|display| display.default_seat())
+            .and_then(|seat| seat.pointer())
+        {
+            let owner = Rc::clone(self);
+            pointer.connect_modifier_state_notify(move |_| owner.keys_changed());
+        }
 
         let drag = gtk::GestureDrag::new();
 
@@ -1334,15 +1342,43 @@ impl Window {
     /// The word under it is looked up when the pointer has rested there long
     /// enough, and only while the modifier key is held down, so that moving
     /// the pointer over the preview does not keep asking the dictionary.
-    fn pointer_moved(self: &Rc<Self>, x: f64, y: f64, state: gdk::ModifierType) {
+    fn pointer_moved(self: &Rc<Self>, x: f64, y: f64, _state: gdk::ModifierType) {
         let settings = crate::settings::read(&self.settings);
-        if !state.contains(settings.modifier.mask()) {
+        let held = Self::keys_held();
+        tracing::debug!(
+            "the pointer is at {x:.0}, {y:.0}; the keys held are {held:?}; the key wanted is {:?}",
+            settings.modifier
+        );
+        if !held.contains(settings.modifier.mask()) {
             self.cancel_scan();
             self.card.hide();
             return;
         }
         *self.pointer.borrow_mut() = Some((x, y));
         self.restart_scan(settings.scan_delay);
+    }
+
+    /// The keys that are held down.
+    ///
+    /// The state is taken from the pointer's own device and not from the
+    /// event that moved it, because the event does not always say which keys
+    /// were held.
+    fn keys_held() -> gdk::ModifierType {
+        gdk::Display::default()
+            .and_then(|display| display.default_seat())
+            .and_then(|seat| seat.pointer())
+            .map(|pointer| pointer.modifier_state())
+            .unwrap_or(gdk::ModifierType::empty())
+    }
+
+    /// The keys have changed, so the word under the pointer is looked up
+    /// again, which is what happens when the key is pressed while the
+    /// pointer rests over a word.
+    fn keys_changed(self: &Rc<Self>) {
+        let settings = crate::settings::read(&self.settings);
+        if Self::keys_held().contains(settings.modifier.mask()) {
+            self.restart_scan(settings.scan_delay);
+        }
     }
 
     /// Starts the timer that looks the word up.
@@ -1374,11 +1410,18 @@ impl Window {
         };
         let lines = self.preview.detections.borrow().clone();
         let point = crate::hover::Point::new(x, y);
+        tracing::debug!(
+            "looking at {x:.0}, {y:.0} of a frame of {frame_width:.0}, {frame_height:.0} \
+             drawn at {drawn:?}, over {} line(s)",
+            lines.len()
+        );
         let Some(word) = crate::hover::word_under(&lines, point, frame_width, frame_height, drawn)
         else {
+            tracing::debug!("there is no word under the pointer");
             self.card.hide();
             return;
         };
+        tracing::debug!("the word under the pointer is {:?}", word.text);
         let text = word.text.trim().to_owned();
         if text.is_empty() {
             self.card.hide();
@@ -1797,6 +1840,7 @@ mod tests {
             .expect("the thing in front should be a button");
         assert_eq!(button.label().as_deref(), Some("Preview"));
     }
+
 
     /// The timestamp shown beside a list entry.
     #[test]
