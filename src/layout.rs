@@ -347,8 +347,17 @@ fn push_group(run: &mut Vec<usize>, groups: &mut Vec<Vec<usize>>) {
 }
 
 /// Builds a list out of a run of lines.
-fn make_list(lines: &[&Line]) -> (Vec<String>, Rect) {
-    let items = lines.iter().map(|line| line_text(line)).collect::<Vec<_>>();
+fn make_list(lines: &[&Line]) -> (Vec<String>, Rect, Vec<(usize, usize)>) {
+    let mut items = Vec::new();
+    let mut words = Vec::new();
+    let mut offset = 0usize;
+    for line in lines {
+        let (text, _places) = line_text(line);
+        let start = offset;
+        offset += text.chars().count() + 1;
+        words.push((start, start + text.chars().count()));
+        items.push(text);
+    }
     let bounds = Rect::union(&lines.iter().map(|line| line.bounds).collect::<Vec<_>>())
         .unwrap_or(Rect {
             x: 0.0,
@@ -356,7 +365,7 @@ fn make_list(lines: &[&Line]) -> (Vec<String>, Rect) {
             width: 0.0,
             height: 0.0,
         });
-    (items, bounds)
+    (items, bounds, words)
 }
 
 /// A piece of the text, in reading order.
@@ -367,12 +376,24 @@ pub enum Block {
         text: String,
         level: u8,
         bounds: Rect,
+        /// Where each word is in the text, counted in characters.
+        words: Vec<(usize, usize)>,
     },
     /// A run of lines that belong together.
-    Paragraph { text: String, bounds: Rect },
+    Paragraph {
+        text: String,
+        bounds: Rect,
+        /// Where each word is in the text, counted in characters.
+        words: Vec<(usize, usize)>,
+    },
     /// A run of short, aligned items that belong together, such as the
     /// entries of a menu.
-    List { items: Vec<String>, bounds: Rect },
+    List {
+        items: Vec<String>,
+        bounds: Rect,
+        /// Where each item is in the text, counted in characters.
+        words: Vec<(usize, usize)>,
+    },
 }
 
 /// A block of text that had not been seen before.
@@ -401,6 +422,15 @@ impl Block {
         match self {
             Block::Heading { text, .. } | Block::Paragraph { text, .. } => text.clone(),
             Block::List { items, .. } => items.join(IDEOGRAPHIC_SPACE),
+        }
+    }
+
+    /// Where each word is in the text, counted in characters.
+    pub fn words(&self) -> &[(usize, usize)] {
+        match self {
+            Block::Heading { words, .. }
+            | Block::Paragraph { words, .. }
+            | Block::List { words, .. } => words,
         }
     }
 
@@ -665,6 +695,7 @@ fn order_horizontal(
                     text: line.text.trim().to_owned(),
                     level,
                     bounds: line.bounds,
+                    words: Vec::new(),
                 },
                 bounds: line.bounds,
             }),
@@ -694,18 +725,20 @@ fn order_horizontal(
             block: Block::Paragraph {
                 text: paragraph.text,
                 bounds: paragraph.bounds,
+                words: paragraph.words,
             },
         })
         .collect();
 
     for group in &groups {
         let lines: Vec<&Line> = group.iter().map(|index| sorted[*index]).collect();
-        let (entries, bounds) = make_list(&lines);
+        let (entries, bounds, words) = make_list(&lines);
         items.push(Item {
             bounds,
             block: Block::List {
                 items: entries,
                 bounds,
+                words,
             },
         });
     }
@@ -723,8 +756,9 @@ fn order_horizontal(
 /// Where the page has a large gap between two blocks, the break is kept and
 /// the next block is set out with an ideographic space, which is how a
 /// paragraph is marked in Japanese.
-pub fn join_blocks(blocks: &[Fresh]) -> String {
+pub fn join_blocks(blocks: &[Fresh]) -> (String, Vec<(usize, usize)>) {
     let mut text = String::new();
+    let mut words = Vec::new();
     for (index, entry) in blocks.iter().enumerate() {
         if index > 0 {
             text.push('\n');
@@ -732,9 +766,17 @@ pub fn join_blocks(blocks: &[Fresh]) -> String {
                 text.push_str(IDEOGRAPHIC_SPACE);
             }
         }
+        let offset = text.chars().count();
         text.push_str(&entry.block.text());
+        words.extend(
+            entry
+                .block
+                .words()
+                .iter()
+                .map(|(from, to)| (from + offset, to + offset)),
+        );
     }
-    text
+    (text, words)
 }
 
 /// Orders the lines that run downwards.
@@ -759,6 +801,7 @@ fn order_vertical(lines: &[&Line]) -> Vec<Block> {
         .map(|line| Block::Paragraph {
             text: line.text.trim().to_owned(),
             bounds: line.bounds,
+            words: Vec::new(),
         })
         .collect()
 }
@@ -835,6 +878,8 @@ fn x_overlap(column: &[Item], bounds: Rect) -> f64 {
 struct Paragraph {
     text: String,
     bounds: Rect,
+    /// Where each word is in the text, counted in characters.
+    words: Vec<(usize, usize)>,
 }
 
 /// Groups the lines into paragraphs.
@@ -930,6 +975,7 @@ fn make_paragraph(lines: &[&Line], clump: bool) -> Paragraph {
     let spaced = lines.iter().any(|line| words_are_spaced(line));
 
     let mut text = String::new();
+    let mut words = Vec::new();
     for line in lines {
         if !text.is_empty() {
             if clump {
@@ -944,7 +990,14 @@ fn make_paragraph(lines: &[&Line], clump: bool) -> Paragraph {
                 text.push('\n');
             }
         }
-        text.push_str(&line_text(line));
+        let (line_text, places) = line_text(line);
+        let offset = text.chars().count();
+        text.push_str(&line_text);
+        words.extend(
+            places
+                .into_iter()
+                .map(|(from, to)| (from + offset, to + offset)),
+        );
     }
     let bounds = Rect::union(&lines.iter().map(|line| line.bounds).collect::<Vec<_>>()).unwrap_or(Rect {
         x: 0.0,
@@ -952,7 +1005,7 @@ fn make_paragraph(lines: &[&Line], clump: bool) -> Paragraph {
         width: 0.0,
         height: 0.0,
     });
-    Paragraph { text, bounds }
+    Paragraph { text, bounds, words }
 }
 
 /// Whether the words of the line are set apart by spaces.
@@ -966,9 +1019,9 @@ fn words_are_spaced(line: &Line) -> bool {
 /// The text of a line, put back together from its words.
 ///
 /// A line that reads from the right is put back together in that order.
-fn line_text(line: &Line) -> String {
+fn line_text(line: &Line) -> (String, Vec<(usize, usize)>) {
     if line.words.is_empty() {
-        return line.text.trim().to_owned();
+        return (line.text.trim().to_owned(), Vec::new());
     }
     let mut words: Vec<&Word> = line.words.iter().collect();
     if line.is_right_to_left {
@@ -980,13 +1033,17 @@ fn line_text(line: &Line) -> String {
         });
     }
     let mut text = String::new();
+    let mut places = Vec::new();
     for word in words {
+        let start = text.chars().count();
         text.push_str(word.text.trim());
+        let end = text.chars().count();
+        places.push((start, end));
         if word.has_space_after {
             text.push(' ');
         }
     }
-    text.trim_end().to_owned()
+    (text.trim_end().to_owned(), places)
 }
 
 /// How big a heading is, if the line is one.
@@ -1197,6 +1254,29 @@ mod tests {
         assert_eq!(texts(&layout.blocks), vec!["first second third"]);
     }
 
+    /// The words of a block come with where they are in it, so that the
+    /// pointer over the text can be answered without asking anything.
+    #[test]
+    fn the_words_of_a_block_come_with_where_they_are() {
+        let mut first = line("人気", 10.0, 20.0, 40.0, 20.0);
+        first.words = vec![word("人気", 10.0, 20.0, 40.0, 20.0)];
+        first.words[0].has_space_after = false;
+        let mut second = line("のおかず", 10.0, 40.0, 60.0, 20.0);
+        second.words = vec![
+            word("の", 10.0, 40.0, 20.0, 20.0),
+            word("おかず", 30.0, 40.0, 40.0, 20.0),
+        ];
+        for word in &mut second.words {
+            word.has_space_after = false;
+        }
+
+        let layout = analyse(&[first, second], true, true);
+        let block = layout.blocks.first().expect("a block");
+
+        assert_eq!(block.text(), "人気のおかず");
+        assert_eq!(block.words(), [(0, 2), (2, 3), (3, 6)]);
+    }
+
     /// The engine's layout model says which lines belong together, and it
     /// knows things the geometry alone does not, such as a paragraph whose
     /// first line is indented.
@@ -1343,7 +1423,7 @@ vec![
                 new_paragraph: layout.starts_paragraph(index),
             })
             .collect::<Vec<_>>();
-        let text = crate::layout::join_blocks(&fresh);
+        let (text, _) = crate::layout::join_blocks(&fresh);
 
         assert!(
             text.contains("プレミアムサービス"),
@@ -1433,7 +1513,7 @@ vec![
                 new_paragraph: layout.starts_paragraph(index),
             })
             .collect::<Vec<_>>();
-        let text = crate::layout::join_blocks(&fresh);
+        let (text, _) = crate::layout::join_blocks(&fresh);
         assert!(
             text.contains("\n\u{3000}"),
             "a large gap should leave an ideographic space, got {text:?}"
@@ -1451,14 +1531,17 @@ vec![
     fn a_block_that_was_already_shown_does_not_make_a_break() {
         let blocks = vec![
             Block::Paragraph {
+                words: Vec::new(),
                 text: "above".to_owned(),
                 bounds: Rect { x: 0.0, y: 100.0, width: 100.0, height: 20.0 },
             },
             Block::Paragraph {
+                words: Vec::new(),
                 text: "between".to_owned(),
                 bounds: Rect { x: 0.0, y: 200.0, width: 100.0, height: 200.0 },
             },
             Block::Paragraph {
+                words: Vec::new(),
                 text: "below".to_owned(),
                 bounds: Rect { x: 0.0, y: 420.0, width: 100.0, height: 20.0 },
             },
@@ -1478,7 +1561,7 @@ vec![
             },
         ];
 
-        let text = join_blocks(&fresh);
+        let (text, _) = join_blocks(&fresh);
         assert!(
             !text.contains(IDEOGRAPHIC_SPACE),
             "the gap spans across a block that was shown already, got {text:?}"

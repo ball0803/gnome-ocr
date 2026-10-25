@@ -426,9 +426,10 @@ impl Reader {
                     Asking::Readings { piece, text } => {
                         // The text is broken into the words the language is
                         // made of, once, so that the pointer over it can be
-                        // answered at once.
+                        // answered at once. If the dictionary does not
+                        // answer, the text is left as it is: nothing was
+                        // asked for, so nothing failed.
                         let Ok(segments) = crate::yomitan::tokenize(&text) else {
-                            let _ = done.try_send(Answer::Failed);
                             continue;
                         };
                         if segments.is_empty() {
@@ -500,6 +501,9 @@ struct Window {
     /// Whether the word under the pointer has been looked up since it last
     /// moved.
     scanned: Cell<bool>,
+    /// The word that was selected last, so that the window does not keep
+    /// saying it.
+    looked_up: RefCell<Option<String>>,
     /// What is under the pointer, so that a pointer which only jitters is
     /// taken to be still.
     under: RefCell<Option<String>>,
@@ -747,6 +751,7 @@ impl Window {
             over_text: Cell::new(false),
             last_moved: Cell::new(0.0),
             scanned: Cell::new(false),
+            looked_up: RefCell::new(None),
             under: RefCell::new(None),
             settings: settings.clone(),
             copy_button,
@@ -1280,7 +1285,8 @@ impl Window {
                 if !fresh.is_empty() {
                     // The blocks are already in reading order.
                     let joined = crate::layout::join_blocks(&fresh);
-                    let piece = self.append(&format!("{joined}\n"));
+                    let (joined, words) = joined;
+                    let piece = self.append(&format!("{joined}\n"), words);
                     if self.auto_copy.is_active() {
                         self.root.clipboard().set_text(&joined);
                     }
@@ -1331,7 +1337,7 @@ impl Window {
         section: Option<crate::layout::Heading>,
     ) {
         let source = self.source_id.borrow().clone();
-        let text = crate::layout::join_blocks(blocks);
+        let (text, _) = crate::layout::join_blocks(blocks);
 
         // The same screen keeps one entry, and more text is added to it.
         if let Some(entry) = self.entries.borrow_mut().get_mut(&source) {
@@ -1399,12 +1405,12 @@ impl Window {
     }
 
     /// Adds a piece of text and shows it, and says which piece it was.
-    fn append(&self, text: &str) -> usize {
+    fn append(&self, text: &str, words: Vec<(usize, usize)>) -> usize {
         let piece = self.pieces.borrow_mut().len();
         self.pieces.borrow_mut().push(Piece {
             plain: text.to_owned(),
             text: text.to_owned(),
-            words: Vec::new(),
+            words,
         });
         self.render();
         piece
@@ -1591,6 +1597,10 @@ impl Window {
             // all that happens: the dictionary is asked when the user asks.
             self.select(range);
             tracing::debug!("the word under the pointer is {word:?}");
+            if self.looked_up.borrow().as_deref() != Some(word.as_str()) {
+                *self.looked_up.borrow_mut() = Some(word.clone());
+                self.set_status(&format!("Selected: {word}"));
+            }
             return;
         }
 
@@ -1614,6 +1624,10 @@ impl Window {
             return;
         }
         tracing::debug!("the word under the pointer is {text:?}");
+        if self.looked_up.borrow().as_deref() != Some(text.as_str()) {
+            *self.looked_up.borrow_mut() = Some(text.clone());
+            self.set_status(&format!("Selected: {text}"));
+        }
     }
 
     /// Selects a word in the text, so that it is clear which word is being

@@ -217,7 +217,7 @@ would have been.
 Hold the **scan modifier key** and move the pointer over a word in the
 text, and the word is selected, as if it had been dragged over. That is
 all that happens: nothing is asked of the dictionary while the pointer is
-moving.
+moving. The line at the bottom of the window says which word is selected.
 
 To see what the word means, press **Look up**, and the card shows it.
 
