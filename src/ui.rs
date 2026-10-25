@@ -22,9 +22,6 @@ use crate::region::Region;
 
 const APP_ID: &str = "dev.local.gnome_ocr";
 
-/// The width of the window.
-const WINDOW_WIDTH: i32 = 1240;
-
 /// How many entries the list keeps before the oldest are dropped.
 const MAX_LIST_ENTRIES: usize = 200;
 
@@ -484,8 +481,9 @@ impl Window {
         preview_pane.append(&show_boxes);
         preview_pane.append(&canvas);
 
+        // The button that clears the chosen part stays in the row above,
+        // which is always there, because the preview can be hidden.
         let preview_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        preview_buttons.append(&reset_button);
         preview_buttons.append(&gtk::Label::new(Some(
             "Drag on the preview to choose the part to recognise.",
         )));
@@ -566,7 +564,8 @@ impl Window {
         split.set_end_child(Some(&output_pane));
         split.set_vexpand(true);
         split.set_wide_handle(true);
-        split.set_position(WINDOW_WIDTH / 4);
+        // The preview is a quarter of the width and the text the rest.
+        split.set_position(root.default_width() / 4);
 
         let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
         layout.append(&toolbar);
@@ -1300,9 +1299,82 @@ mod tests {
         }
     }
 
-    /// GtkGestureDrag reports the offset from the point the drag started at,
-    /// so the position of the pointer is the start plus that offset.
+    /// Looks for a label with the given text in the tree of widgets.
+    fn find_label(widget: &gtk::Widget, text: &str) -> Option<gtk::Widget> {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            if label.text() == text {
+                return Some(widget.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = find_label(&current, text) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    /// The preview is a quarter of the width and the text the rest, so the
+    /// picture is a third of the size of the text, and the button in front of
+    /// the choice of how the text is shown takes it away.
+    ///
+    /// This is all in one test because GTK can only be started once, and only
+    /// from one thread, so two tests could not both have a window.
     #[test]
+    fn the_preview_takes_a_quarter_of_the_width_and_can_be_hidden() {
+        if gtk::init().is_err() {
+            // There is no display, so there is nothing to lay out.
+            return;
+        }
+        let app = gtk::Application::builder()
+            .application_id("org.gnome.Ocr.Test")
+            .build();
+        let window = Window::build(&app, true);
+
+        let width = window.root.default_width();
+        assert_eq!(
+            window.split.position(),
+            width / 4,
+            "the preview should be a quarter of the width of {width}"
+        );
+
+        assert!(
+            window.split.start_child().is_some(),
+            "the picture should be there to begin with"
+        );
+        window.preview_button.set_active(false);
+        assert!(
+            window.split.start_child().is_none(),
+            "the picture should be gone"
+        );
+        window.preview_button.set_active(true);
+        assert!(
+            window.split.start_child().is_some(),
+            "the picture should be back"
+        );
+
+        // The button stands in front of the choice of how the text is shown.
+        let show_as = find_label(window.root.upcast_ref(), "Show as")
+            .expect("the choice of how the text is shown should be there");
+        let parent = show_as.parent().expect("the label should have a parent");
+        let mut in_front = None;
+        let mut child = parent.first_child();
+        while let Some(current) = child {
+            if current == show_as {
+                break;
+            }
+            in_front = Some(current.clone());
+            child = current.next_sibling();
+        }
+        let in_front = in_front.expect("something should stand in front of it");
+        let button = in_front
+            .downcast_ref::<gtk::ToggleButton>()
+            .expect("the thing in front should be a button");
+        assert_eq!(button.label().as_deref(), Some("Preview"));
+    }
+
     /// The timestamp shown beside a list entry.
     #[test]
     fn the_timestamp_is_not_empty() {
@@ -1343,6 +1415,8 @@ mod tests {
         );
     }
 
+    /// GtkGestureDrag reports the offset from the point the drag started at,
+    /// so the position of the pointer is the start plus that offset.
     #[test]
     fn the_pointer_position_is_the_start_plus_the_offset() {
         let start = (120.0f64, 240.0f64);
