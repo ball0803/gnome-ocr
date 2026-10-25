@@ -5,6 +5,7 @@
 //! which word the pointer is over, which is what the lookup needs.
 
 use crate::layout::{Line, Word};
+use crate::yomitan::Segment;
 
 /// A point in the pixels of the captured frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,6 +44,21 @@ pub fn word_at(line: &Line, point: Point) -> Option<&Word> {
                 point,
             )
         })
+}
+
+/// The word of the text that the character offset falls in.
+///
+/// The offset counts characters, the way the text of a widget counts them.
+pub fn word_at_offset(segments: &[Segment], offset: usize) -> Option<&Segment> {
+    let mut seen = 0usize;
+    for segment in segments {
+        let length = segment.text.chars().count();
+        if offset < seen + length {
+            return Some(segment);
+        }
+        seen += length;
+    }
+    None
 }
 
 /// The line that the point is over.
@@ -135,6 +151,31 @@ mod tests {
 
         let found = word_at(&line, Point::new(20.0, 30.0)).expect("a word");
         assert_eq!(found.text, "人気");
+    }
+
+    /// The word a character falls in is the one that is found.
+    #[test]
+    fn the_word_under_a_character_is_found() {
+        let segments = [
+            Segment {
+                text: "人気".to_owned(),
+                reading: Some("にんき".to_owned()),
+            },
+            Segment {
+                text: "の".to_owned(),
+                reading: None,
+            },
+            Segment {
+                text: "おかず".to_owned(),
+                reading: None,
+            },
+        ];
+
+        assert_eq!(word_at_offset(&segments, 0).map(|s| s.text.as_str()), Some("人気"));
+        assert_eq!(word_at_offset(&segments, 1).map(|s| s.text.as_str()), Some("人気"));
+        assert_eq!(word_at_offset(&segments, 2).map(|s| s.text.as_str()), Some("の"));
+        assert_eq!(word_at_offset(&segments, 3).map(|s| s.text.as_str()), Some("おかず"));
+        assert!(word_at_offset(&segments, 9).is_none());
     }
 
     /// A point outside every word is on no word.

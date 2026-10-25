@@ -370,6 +370,8 @@ enum Asking {
     Selected { text: String },
     /// The dictionary entries for the word the pointer is over.
     Pointed { text: String },
+    /// The word under the pointer in the text, and the text it is in.
+    PointedInText { offset: usize, text: String },
 }
 
 /// What came back.
@@ -438,6 +440,27 @@ impl Reader {
                             pointed: true,
                         });
                     }
+                    Asking::PointedInText { offset, text } => {
+                        let segments = crate::yomitan::tokenize(&text).unwrap_or_default();
+                        let Some(word) = crate::hover::word_at_offset(&segments, offset) else {
+                            let _ = done.try_send(Answer::Failed);
+                            continue;
+                        };
+                        let word = word.text.trim().to_owned();
+                        if word.is_empty() {
+                            let _ = done.try_send(Answer::Failed);
+                            continue;
+                        }
+                        let Ok(entries) = crate::yomitan::entries(&word) else {
+                            let _ = done.try_send(Answer::Failed);
+                            continue;
+                        };
+                        let _ = done.try_send(Answer::Entries {
+                            text: word,
+                            entries,
+                            pointed: true,
+                        });
+                    }
                 }
             }
         });
@@ -466,8 +489,10 @@ struct Window {
     readings: gtk::CheckButton,
     lookup_button: gtk::Button,
     card: crate::card::Card,
-    /// Where the pointer was, in the pixels of the preview.
+    /// Where the pointer was, in the pixels of the widget it was over.
     pointer: RefCell<Option<(f64, f64)>>,
+    /// Whether the pointer was over the text rather than the preview.
+    over_text: Cell<bool>,
     /// The timer that looks the word up once the pointer has rested.
     scan_source: RefCell<Option<glib::SourceId>>,
     settings: settings::Shared,
@@ -710,6 +735,7 @@ impl Window {
             lookup_button: lookup_button.clone(),
             card: crate::card::Card::new(),
             pointer: RefCell::new(None),
+            over_text: Cell::new(false),
             scan_source: RefCell::new(None),
             settings: settings.clone(),
             copy_button,
@@ -854,10 +880,21 @@ impl Window {
         // be looked up once it has rested there.
         let motion = gtk::EventControllerMotion::new();
         let owner = Rc::clone(self);
-        motion.connect_motion(move |_controller, x, y| {
-            owner.pointer_moved(x, y, gdk::ModifierType::empty());
+        motion.connect_motion(move |controller, x, y| {
+            let from_event = controller
+                .current_event()
+                .map(|event| event.modifier_state())
+                .unwrap_or_else(gdk::ModifierType::empty);
+            owner.pointer_moved(x, y, from_event);
         });
         self.canvas.add_controller(motion);
+
+        let motion = gtk::EventControllerMotion::new();
+        let owner = Rc::clone(self);
+        motion.connect_motion(move |_controller, x, y| {
+            owner.text_pointer_moved(x, y);
+        });
+        self.text_view.add_controller(motion);
 
         if let Some(pointer) = gdk::Display::default()
             .and_then(|display| display.default_seat())
@@ -1342,11 +1379,13 @@ impl Window {
     /// The word under it is looked up when the pointer has rested there long
     /// enough, and only while the modifier key is held down, so that moving
     /// the pointer over the preview does not keep asking the dictionary.
-    fn pointer_moved(self: &Rc<Self>, x: f64, y: f64, _state: gdk::ModifierType) {
+    fn pointer_moved(self: &Rc<Self>, x: f64, y: f64, from_event: gdk::ModifierType) {
         let settings = crate::settings::read(&self.settings);
-        let held = Self::keys_held();
+        let from_device = Self::keys_held();
+        let held = from_event | from_device;
         tracing::debug!(
-            "the pointer is at {x:.0}, {y:.0}; the keys held are {held:?}; the key wanted is {:?}",
+            "the pointer is at {x:.0}, {y:.0}; the event says {from_event:?}, the device \
+             says {from_device:?}; the key wanted is {:?}",
             settings.modifier
         );
         if !held.contains(settings.modifier.mask()) {
@@ -1354,6 +1393,25 @@ impl Window {
             self.card.hide();
             return;
         }
+        self.over_text.set(false);
+        *self.pointer.borrow_mut() = Some((x, y));
+        self.restart_scan(settings.scan_delay);
+    }
+
+    /// The pointer moved over the text.
+    fn text_pointer_moved(self: &Rc<Self>, x: f64, y: f64) {
+        let settings = crate::settings::read(&self.settings);
+        let held = Self::keys_held();
+        tracing::debug!(
+            "the pointer is over the text at {x:.0}, {y:.0}; the keys held are {held:?}; \
+             the key wanted is {:?}",
+            settings.modifier
+        );
+        if !held.contains(settings.modifier.mask()) {
+            self.card.hide();
+            return;
+        }
+        self.over_text.set(true);
         *self.pointer.borrow_mut() = Some((x, y));
         self.restart_scan(settings.scan_delay);
     }
@@ -1377,6 +1435,7 @@ impl Window {
     fn keys_changed(self: &Rc<Self>) {
         let settings = crate::settings::read(&self.settings);
         if Self::keys_held().contains(settings.modifier.mask()) {
+            tracing::debug!("the keys changed, and the key wanted is held");
             self.restart_scan(settings.scan_delay);
         }
     }
@@ -1404,6 +1463,32 @@ impl Window {
         let Some((x, y)) = *self.pointer.borrow() else {
             return;
         };
+        if self.over_text.get() {
+            let Some(iter) = self
+                .text_view
+                .iter_at_location(x.round() as i32, y.round() as i32)
+            else {
+                return;
+            };
+            let offset = iter.offset() as usize;
+            let text = self
+                .buffer
+                .text(&self.buffer.start_iter(), &self.buffer.end_iter(), false)
+                .to_string();
+            tracing::debug!(
+                "looking at character {offset} of {} character(s) of text",
+                text.chars().count()
+            );
+            if text.is_empty() {
+                return;
+            }
+            let _ = self
+                .reader
+                .jobs
+                .try_send(Asking::PointedInText { offset, text });
+            return;
+        }
+
         let (frame_width, frame_height) = self.preview.frame_size.get();
         let Some(drawn) = self.preview.rect.get() else {
             return;
