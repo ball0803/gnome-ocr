@@ -49,12 +49,12 @@ pub fn word_at(line: &Line, point: Point) -> Option<&Word> {
 /// The word of the text that the character offset falls in.
 ///
 /// The offset counts characters, the way the text of a widget counts them.
-pub fn word_at_offset(segments: &[Segment], offset: usize) -> Option<&Segment> {
+pub fn word_at_offset(segments: &[Segment], offset: usize) -> Option<(usize, usize, &Segment)> {
     let mut seen = 0usize;
     for segment in segments {
         let length = segment.text.chars().count();
         if offset < seen + length {
-            return Some(segment);
+            return Some((seen, seen + length, segment));
         }
         seen += length;
     }
@@ -171,11 +171,19 @@ mod tests {
             },
         ];
 
-        assert_eq!(word_at_offset(&segments, 0).map(|s| s.text.as_str()), Some("人気"));
-        assert_eq!(word_at_offset(&segments, 1).map(|s| s.text.as_str()), Some("人気"));
-        assert_eq!(word_at_offset(&segments, 2).map(|s| s.text.as_str()), Some("の"));
-        assert_eq!(word_at_offset(&segments, 3).map(|s| s.text.as_str()), Some("おかず"));
+        let text_at = |offset: usize| {
+            word_at_offset(&segments, offset).map(|(_, _, segment)| segment.text.as_str())
+        };
+        assert_eq!(text_at(0), Some("人気"));
+        assert_eq!(text_at(1), Some("人気"));
+        assert_eq!(text_at(2), Some("の"));
+        assert_eq!(text_at(3), Some("おかず"));
         assert!(word_at_offset(&segments, 9).is_none());
+
+        // The word is also given with the place it takes, so that it can be
+        // selected in the text.
+        let (start, end, _) = word_at_offset(&segments, 3).expect("a word");
+        assert_eq!((start, end), (3, 6));
     }
 
     /// A point outside every word is on no word.

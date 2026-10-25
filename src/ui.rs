@@ -91,6 +91,8 @@ struct Preview {
     start: Cell<Option<(f64, f64)>>,
     /// The size of the frame the detections were found in.
     frame_size: Cell<(f64, f64)>,
+    /// The word the pointer is over, so that it can be shown.
+    hovered: RefCell<Option<crate::layout::Rect>>,
     /// Everything the recogniser found in the last frame.
     detections: RefCell<Vec<crate::layout::Line>>,
     /// Whether to draw where the text was found.
@@ -107,6 +109,7 @@ impl Preview {
             rect: Cell::new(None),
             start: Cell::new(None),
             frame_size: Cell::new((0.0, 0.0)),
+            hovered: RefCell::new(None),
             detections: RefCell::new(Vec::new()),
             show_boxes: Cell::new(true),
         }
@@ -211,16 +214,21 @@ impl Preview {
 
     /// Where a line sits in the preview.
     fn line_rect(&self, line: &crate::layout::Line) -> Option<(f64, f64, f64, f64)> {
+        self.rect_of(&line.bounds)
+    }
+
+    /// A box of the frame, as it is drawn in the preview.
+    fn rect_of(&self, bounds: &crate::layout::Rect) -> Option<(f64, f64, f64, f64)> {
         let (frame_width, frame_height) = self.frame_size.get();
         let (left, top, width, height) = self.rect.get()?;
         if frame_width <= 0.0 || frame_height <= 0.0 {
             return None;
         }
         Some((
-            left + line.bounds.x / frame_width * width,
-            top + line.bounds.y / frame_height * height,
-            line.bounds.width / frame_width * width,
-            line.bounds.height / frame_height * height,
+            left + bounds.x / frame_width * width,
+            top + bounds.y / frame_height * height,
+            bounds.width / frame_width * width,
+            bounds.height / frame_height * height,
         ))
     }
 
@@ -384,6 +392,8 @@ enum Answer {
         entries: Vec<crate::yomitan::Entry>,
         /// Whether the pointer was over the word.
         pointed: bool,
+        /// Where the word is in the text, when it was found in the text.
+        range: Option<(usize, usize)>,
     },
     /// The API did not answer.
     Failed,
@@ -427,6 +437,7 @@ impl Reader {
                             text,
                             entries,
                             pointed: false,
+                            range: None,
                         });
                     }
                     Asking::Pointed { text } => {
@@ -438,15 +449,18 @@ impl Reader {
                             text,
                             entries,
                             pointed: true,
+                            range: None,
                         });
                     }
                     Asking::PointedInText { offset, text } => {
                         let segments = crate::yomitan::tokenize(&text).unwrap_or_default();
-                        let Some(word) = crate::hover::word_at_offset(&segments, offset) else {
+                        let Some((start, end, segment)) =
+                            crate::hover::word_at_offset(&segments, offset)
+                        else {
                             let _ = done.try_send(Answer::Failed);
                             continue;
                         };
-                        let word = word.text.trim().to_owned();
+                        let word = segment.text.trim().to_owned();
                         if word.is_empty() {
                             let _ = done.try_send(Answer::Failed);
                             continue;
@@ -459,6 +473,7 @@ impl Reader {
                             text: word,
                             entries,
                             pointed: true,
+                            range: Some((start, end)),
                         });
                     }
                 }
@@ -812,6 +827,16 @@ impl Window {
             let _ = context.paint();
             let _ = context.restore();
 
+            // The word the pointer is over.
+            if let Some(word) = preview.hovered.borrow().as_ref()
+                && let Some((box_x, box_y, box_width, box_height)) = preview.rect_of(word)
+            {
+                context.set_source_rgba(1.0, 0.8, 0.2, 1.0);
+                context.set_line_width(2.5);
+                context.rectangle(box_x, box_y, box_width, box_height);
+                let _ = context.stroke();
+            }
+
             // Where the text was found.
             if preview.show_boxes.get() {
                 for line in preview.detections.borrow().iter() {
@@ -1136,7 +1161,8 @@ impl Window {
                         text,
                         entries,
                         pointed,
-                    } => owner.show_entries(pointed, &text, &entries),
+                        range,
+                    } => owner.show_entries(pointed, range, &text, &entries),
                     Answer::Failed => owner.set_status(
                         "Yomitan is not answering. It has to be running, with the API \
                          turned on, for the readings and the lookups.",
@@ -1390,6 +1416,7 @@ impl Window {
         );
         if !held.contains(settings.modifier.mask()) {
             self.cancel_scan();
+            self.hovered_word(None);
             self.card.hide();
             return;
         }
@@ -1503,10 +1530,12 @@ impl Window {
         let Some(word) = crate::hover::word_under(&lines, point, frame_width, frame_height, drawn)
         else {
             tracing::debug!("there is no word under the pointer");
+            self.hovered_word(None);
             self.card.hide();
             return;
         };
         tracing::debug!("the word under the pointer is {:?}", word.text);
+        self.hovered_word(Some(word.bounds));
         let text = word.text.trim().to_owned();
         if text.is_empty() {
             self.card.hide();
@@ -1515,11 +1544,43 @@ impl Window {
         let _ = self.reader.jobs.try_send(Asking::Pointed { text });
     }
 
+    /// Selects a word in the text, so that it is clear which word is being
+    /// looked up.
+    fn select(&self, range: (usize, usize)) {
+        let mut start = self.buffer.start_iter();
+        let mut end = self.buffer.start_iter();
+        start.set_offset(range.0 as i32);
+        end.set_offset(range.1 as i32);
+        self.buffer.select_range(&start, &end);
+    }
+
+    /// Shows the word the pointer is over in the preview, or takes it away.
+    fn hovered_word(&self, bounds: Option<crate::layout::Rect>) {
+        let changed = {
+            let mut hovered = self.preview.hovered.borrow_mut();
+            let changed = hovered.as_ref() != bounds.as_ref();
+            *hovered = bounds;
+            changed
+        };
+        if changed {
+            self.canvas.queue_draw();
+        }
+    }
+
     /// Shows what the dictionary says about a word.
     ///
     /// The card appears beside the pointer when the pointer was over the word,
     /// and beside the text when the words were selected in it.
-    fn show_entries(&self, pointed: bool, text: &str, entries: &[crate::yomitan::Entry]) {
+    fn show_entries(
+        &self,
+        pointed: bool,
+        range: Option<(usize, usize)>,
+        text: &str,
+        entries: &[crate::yomitan::Entry],
+    ) {
+        if let Some(range) = range {
+            self.select(range);
+        }
         if entries.is_empty() {
             self.set_status(&format!("Nothing is known about {text}."));
             self.card.hide();
