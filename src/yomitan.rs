@@ -99,22 +99,28 @@ pub fn entries(term: &str) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// The text with the readings marked: 人気（にんき）のおかず
+/// The text with the readings marked, and where each word is in it.
 ///
 /// The text is rebuilt from the pieces, so the reading of a word ends up
 /// right after the word itself. A piece whose reading is the same as the
 /// piece says nothing new, so it is left alone.
 ///
+/// The places are counted in characters, so that a caller can select one of
+/// the words in the text it is given.
+///
 /// The text is returned as it is when there are no pieces, so that
 /// something can always be shown even when the API did not answer.
-pub fn with_readings(text: &str, segments: &[Segment]) -> String {
+pub fn with_readings(text: &str, segments: &[Segment]) -> (String, Vec<(usize, usize)>) {
     if segments.is_empty() {
-        return text.to_owned();
+        return (text.to_owned(), Vec::new());
     }
-
     let mut out = String::new();
+    let mut words = Vec::new();
     for segment in segments {
+        let start = out.chars().count();
         out.push_str(&segment.text);
+        let end = out.chars().count();
+        words.push((start, end));
         let Some(reading) = segment.reading.as_ref() else {
             continue;
         };
@@ -125,7 +131,22 @@ pub fn with_readings(text: &str, segments: &[Segment]) -> String {
         out.push_str(reading);
         out.push('）');
     }
-    out
+    (out, words)
+}
+
+/// Where each word is in the text, counted in characters.
+///
+/// The words are the pieces the text was broken into, so they are the words
+/// of the language rather than the words of the recogniser.
+pub fn word_ranges(segments: &[Segment]) -> Vec<(usize, usize)> {
+    let mut words = Vec::new();
+    let mut seen = 0usize;
+    for segment in segments {
+        let length = segment.text.chars().count();
+        words.push((seen, seen + length));
+        seen += length;
+    }
+    words
 }
 
 /// Sends a request to the API and returns the body of the answer.
@@ -607,7 +628,7 @@ mod tests {
             segment("おかず", None),
         ];
 
-        let text = with_readings("人気のおかず", &segments);
+        let (text, _) = with_readings("人気のおかず", &segments);
 
         assert_eq!(text, "人気（にんき）のおかず");
     }
@@ -617,7 +638,7 @@ mod tests {
     fn a_word_without_a_reading_is_left_alone() {
         let segments = [segment("おかず", None)];
 
-        let text = with_readings("おかず", &segments);
+        let (text, _) = with_readings("おかず", &segments);
 
         assert_eq!(text, "おかず");
     }
@@ -628,7 +649,7 @@ mod tests {
     fn a_word_that_reads_as_itself_is_left_alone() {
         let segments = [segment("テレビ", Some("テレビ"))];
 
-        let text = with_readings("テレビ", &segments);
+        let (text, _) = with_readings("テレビ", &segments);
 
         assert_eq!(text, "テレビ");
     }
@@ -637,7 +658,7 @@ mod tests {
     /// was recognised is all there is to show.
     #[test]
     fn the_text_is_shown_as_it_is_when_there_are_no_pieces() {
-        let text = with_readings("人気のおかず", &[]);
+        let (text, _) = with_readings("人気のおかず", &[]);
 
         assert_eq!(text, "人気のおかず");
     }

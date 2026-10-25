@@ -5,7 +5,6 @@
 //! which word the pointer is over, which is what the lookup needs.
 
 use crate::layout::{Line, Word};
-use crate::yomitan::Segment;
 
 /// A point in the pixels of the captured frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -46,17 +45,27 @@ pub fn word_at(line: &Line, point: Point) -> Option<&Word> {
         })
 }
 
-/// The word of the text that the character offset falls in.
+
+/// The word at a place in the text, and where it is.
 ///
-/// The offset counts characters, the way the text of a widget counts them.
-pub fn word_at_offset(segments: &[Segment], offset: usize) -> Option<(usize, usize, &Segment)> {
-    let mut seen = 0usize;
-    for segment in segments {
-        let length = segment.text.chars().count();
-        if offset < seen + length {
-            return Some((seen, seen + length, segment));
+/// The pieces are the text as it is shown, and where each word of it is.
+pub fn word_at_offset(
+    pieces: &[(&str, &[(usize, usize)])],
+    offset: usize,
+) -> Option<(String, (usize, usize))> {
+    let mut start = 0usize;
+    for (text, words) in pieces {
+        let length = text.chars().count();
+        if offset < start + length {
+            let within = offset - start;
+            let (from, to) = words
+                .iter()
+                .copied()
+                .find(|(from, to)| within >= *from && within < *to)?;
+            let word: String = text.chars().skip(from).take(to - from).collect();
+            return Some((word, (start + from, start + to)));
         }
-        seen += length;
+        start += length;
     }
     None
 }
@@ -153,37 +162,24 @@ mod tests {
         assert_eq!(found.text, "人気");
     }
 
-    /// The word a character falls in is the one that is found.
+
+    /// The word under a character is found, and where it is.
     #[test]
-    fn the_word_under_a_character_is_found() {
-        let segments = [
-            Segment {
-                text: "人気".to_owned(),
-                reading: Some("にんき".to_owned()),
-            },
-            Segment {
-                text: "の".to_owned(),
-                reading: None,
-            },
-            Segment {
-                text: "おかず".to_owned(),
-                reading: None,
-            },
-        ];
+    fn the_word_under_a_character_is_found_in_the_text() {
+        let first = ("人気のおかず", &[(0usize, 2usize), (2, 3), (3, 6)][..]);
+        let second = ("と", &[(0usize, 1usize)][..]);
 
-        let text_at = |offset: usize| {
-            word_at_offset(&segments, offset).map(|(_, _, segment)| segment.text.as_str())
-        };
-        assert_eq!(text_at(0), Some("人気"));
-        assert_eq!(text_at(1), Some("人気"));
-        assert_eq!(text_at(2), Some("の"));
-        assert_eq!(text_at(3), Some("おかず"));
-        assert!(word_at_offset(&segments, 9).is_none());
+        let (word, range) = word_at_offset(&[first, second], 3).expect("a word");
+        assert_eq!(word, "おかず");
+        assert_eq!(range, (3, 6));
 
-        // The word is also given with the place it takes, so that it can be
-        // selected in the text.
-        let (start, end, _) = word_at_offset(&segments, 3).expect("a word");
-        assert_eq!((start, end), (3, 6));
+        // The word is in the second piece, and the place is in the whole
+        // text.
+        let (word, range) = word_at_offset(&[first, second], 6).expect("a word");
+        assert_eq!(word, "と");
+        assert_eq!(range, (6, 7));
+
+        assert!(word_at_offset(&[first, second], 9).is_none());
     }
 
     /// A point outside every word is on no word.

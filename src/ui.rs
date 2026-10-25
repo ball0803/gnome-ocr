@@ -364,10 +364,15 @@ pub fn run(japanese_only: bool) -> glib::ExitCode {
 
 /// A piece of the text that was shown.
 struct Piece {
-    /// The text as it was recognised.
+    /// The text as it was recognised, which is what is copied.
     plain: String,
-    /// The same text with the readings marked, when they have arrived.
-    annotated: Option<String>,
+    /// The text as it is shown, with the readings marked when they are on.
+    text: String,
+    /// Where each word is in the text, counted in characters.
+    ///
+    /// The words are worked out once, when the text arrives, so that the
+    /// pointer over it can be answered at once and not asked about again.
+    words: Vec<(usize, usize)>,
 }
 
 /// Something to ask Yomitan about.
@@ -378,22 +383,26 @@ enum Asking {
     Selected { text: String },
     /// The dictionary entries for the word the pointer is over.
     Pointed { text: String },
-    /// The word under the pointer in the text, and the text it is in.
-    PointedInText { offset: usize, text: String },
 }
 
 /// What came back.
 enum Answer {
-    /// The readings of a piece of text.
-    Readings { piece: usize, text: String },
+    /// The readings of a piece of text, and where its words are.
+    Readings {
+        piece: usize,
+        /// The text as it is shown.
+        text: String,
+        /// The text as it was recognised.
+        plain: String,
+        /// Where each word is in the text, counted in characters.
+        words: Vec<(usize, usize)>,
+    },
     /// The entries of a word, and where they were asked for.
     Entries {
         text: String,
         entries: Vec<crate::yomitan::Entry>,
         /// Whether the pointer was over the word.
         pointed: bool,
-        /// Where the word is in the text, when it was found in the text.
-        range: Option<(usize, usize)>,
     },
     /// The API did not answer.
     Failed,
@@ -409,13 +418,17 @@ struct Reader {
 }
 
 impl Reader {
-    fn start() -> Self {
+    fn start(settings: settings::Shared) -> Self {
+        let for_settings = settings;
         let (jobs, work) = async_channel::unbounded::<Asking>();
         let (done, answers) = async_channel::unbounded::<Answer>();
         std::thread::spawn(move || {
             while let Ok(asking) = work.recv_blocking() {
                 match asking {
                     Asking::Readings { piece, text } => {
+                        // The text is broken into the words the language is
+                        // made of, once, so that the pointer over it can be
+                        // answered at once.
                         let Ok(segments) = crate::yomitan::tokenize(&text) else {
                             let _ = done.try_send(Answer::Failed);
                             continue;
@@ -423,10 +436,18 @@ impl Reader {
                         if segments.is_empty() {
                             continue;
                         }
-                        let annotated = crate::yomitan::with_readings(&text, &segments);
-                        if !annotated.is_empty() {
-                            let _ = done.try_send(Answer::Readings { piece, text: annotated });
-                        }
+                        let settings = crate::settings::read(&for_settings);
+                        let (shown, words) = if settings.readings {
+                            crate::yomitan::with_readings(&text, &segments)
+                        } else {
+                            (text.clone(), crate::yomitan::word_ranges(&segments))
+                        };
+                        let _ = done.try_send(Answer::Readings {
+                            piece,
+                            text: shown,
+                            plain: text,
+                            words,
+                        });
                     }
                     Asking::Selected { text } => {
                         let Ok(entries) = crate::yomitan::entries(&text) else {
@@ -437,7 +458,6 @@ impl Reader {
                             text,
                             entries,
                             pointed: false,
-                            range: None,
                         });
                     }
                     Asking::Pointed { text } => {
@@ -449,31 +469,6 @@ impl Reader {
                             text,
                             entries,
                             pointed: true,
-                            range: None,
-                        });
-                    }
-                    Asking::PointedInText { offset, text } => {
-                        let segments = crate::yomitan::tokenize(&text).unwrap_or_default();
-                        let Some((start, end, segment)) =
-                            crate::hover::word_at_offset(&segments, offset)
-                        else {
-                            let _ = done.try_send(Answer::Failed);
-                            continue;
-                        };
-                        let word = segment.text.trim().to_owned();
-                        if word.is_empty() {
-                            let _ = done.try_send(Answer::Failed);
-                            continue;
-                        }
-                        let Ok(entries) = crate::yomitan::entries(&word) else {
-                            let _ = done.try_send(Answer::Failed);
-                            continue;
-                        };
-                        let _ = done.try_send(Answer::Entries {
-                            text: word,
-                            entries,
-                            pointed: true,
-                            range: Some((start, end)),
                         });
                     }
                 }
@@ -518,6 +513,9 @@ struct Window {
     /// Whether the word under the pointer has been looked up since it last
     /// moved.
     scanned: Cell<bool>,
+    /// The word that was looked up last, so that it is not asked about again
+    /// while the pointer stays over it.
+    looked_up: RefCell<Option<String>>,
     /// What is under the pointer, so that a pointer which only jitters is
     /// taken to be still.
     under: RefCell<Option<String>>,
@@ -765,6 +763,7 @@ impl Window {
             over_text: Cell::new(false),
             last_moved: Cell::new(0.0),
             scanned: Cell::new(false),
+            looked_up: RefCell::new(None),
             under: RefCell::new(None),
             settings: settings.clone(),
             copy_button,
@@ -782,7 +781,7 @@ impl Window {
             pipeline: RefCell::new(None),
             japanese_only,
             pieces: RefCell::new(Vec::new()),
-            reader: Reader::start(),
+            reader: Reader::start(settings.clone()),
         });
 
         window.draw_preview();
@@ -1200,13 +1199,17 @@ impl Window {
         glib::spawn_future_local(async move {
             while let Ok(answer) = answers.recv().await {
                 match answer {
-                    Answer::Readings { piece, text } => owner.set_reading(piece, text),
+                    Answer::Readings {
+                        piece,
+                        text,
+                        plain,
+                        words,
+                    } => owner.set_piece(piece, text, plain, words),
                     Answer::Entries {
                         text,
                         entries,
                         pointed,
-                        range,
-                    } => owner.show_entries(pointed, range, &text, &entries),
+                    } => owner.show_entries(pointed, &text, &entries),
                     Answer::Failed => {
                         // The card says it, because that is where the answer
                         // would have been.
@@ -1417,10 +1420,36 @@ impl Window {
         let piece = self.pieces.borrow_mut().len();
         self.pieces.borrow_mut().push(Piece {
             plain: text.to_owned(),
-            annotated: None,
+            text: text.to_owned(),
+            words: Vec::new(),
         });
         self.render();
         piece
+    }
+
+    /// The words of a piece of text have been worked out, so the piece is
+    /// shown as it should be.
+    fn set_piece(&self, piece: usize, text: String, plain: String, words: Vec<(usize, usize)>) {
+        {
+            let mut pieces = self.pieces.borrow_mut();
+            let Some(entry) = pieces.get_mut(piece) else {
+                return;
+            };
+            entry.text = text;
+            entry.plain = plain;
+            entry.words = words;
+        }
+        self.render();
+    }
+
+    /// The word at a place in the text, and where it is.
+    fn word_at(&self, offset: usize) -> Option<(String, (usize, usize))> {
+        let pieces = self.pieces.borrow();
+        let pieces = pieces
+            .iter()
+            .map(|piece| (piece.text.as_str(), piece.words.as_slice()))
+            .collect::<Vec<_>>();
+        crate::hover::word_at_offset(&pieces, offset)
     }
 
     /// Shows the text as it stands, with the readings where they are known.
@@ -1429,12 +1458,7 @@ impl Window {
             .pieces
             .borrow()
             .iter()
-            .map(|piece| {
-                piece
-                    .annotated
-                    .as_deref()
-                    .unwrap_or(piece.plain.as_str())
-            })
+            .map(|piece| piece.text.as_str())
             .collect::<Vec<_>>()
             .concat();
         self.buffer.set_text(&all);
@@ -1442,17 +1466,6 @@ impl Window {
     }
 
     /// Sets the reading of a piece of text and shows it.
-    fn set_reading(&self, piece: usize, annotated: String) {
-        {
-            let mut pieces = self.pieces.borrow_mut();
-            let Some(entry) = pieces.get_mut(piece) else {
-                return;
-            };
-            entry.annotated = Some(annotated);
-        }
-        self.render();
-    }
-
     /// The pointer moved over the preview.
     ///
     /// The word under it is looked up when the pointer has rested there long
@@ -1462,11 +1475,6 @@ impl Window {
         let settings = crate::settings::read(&self.settings);
         let from_device = self.keys_held();
         let held = from_event | from_device;
-        tracing::debug!(
-            "the pointer is at {x:.0}, {y:.0}; the event says {from_event:?}, the device \
-             says {from_device:?}; the key wanted is {:?}",
-            settings.modifier
-        );
         if !held.contains(settings.modifier.mask()) {
             self.hovered_word(None);
             self.card.hide();
@@ -1481,11 +1489,6 @@ impl Window {
     fn text_pointer_moved(self: &Rc<Self>, x: f64, y: f64) {
         let settings = crate::settings::read(&self.settings);
         let held = self.keys_held();
-        tracing::debug!(
-            "the pointer is over the text at {x:.0}, {y:.0}; the keys held are {held:?}; \
-             the key wanted is {:?}",
-            settings.modifier
-        );
         if !held.contains(settings.modifier.mask()) {
             self.card.hide();
             return;
@@ -1591,30 +1594,25 @@ impl Window {
             return;
         };
         if self.over_text.get() {
-            let text = self
-                .buffer
-                .text(&self.buffer.start_iter(), &self.buffer.end_iter(), false)
-                .to_string();
-            if text.is_empty() {
-                tracing::debug!("there is no text to look at yet");
-                return;
-            }
             let Some(iter) = self
                 .text_view
                 .iter_at_location(x.round() as i32, y.round() as i32)
             else {
-                tracing::debug!("there is no character at {x:.0}, {y:.0} of the text");
                 return;
             };
             let offset = iter.offset() as usize;
-            tracing::debug!(
-                "looking at character {offset} of {} character(s) of text",
-                text.chars().count()
-            );
-            let _ = self
-                .reader
-                .jobs
-                .try_send(Asking::PointedInText { offset, text });
+            let Some((word, range)) = self.word_at(offset) else {
+                return;
+            };
+            // The word is selected, as if it had been dragged over.
+            self.select(range);
+            // And it is looked up, but only when it is a different word.
+            if self.looked_up.borrow().as_deref() == Some(word.as_str()) {
+                return;
+            }
+            *self.looked_up.borrow_mut() = Some(word.clone());
+            tracing::debug!("the word under the pointer is {word:?}");
+            let _ = self.reader.jobs.try_send(Asking::Pointed { text: word });
             return;
         }
 
@@ -1625,25 +1623,23 @@ impl Window {
         };
         let lines = self.preview.detections.borrow().clone();
         let point = crate::hover::Point::new(x, y);
-        tracing::debug!(
-            "looking at {x:.0}, {y:.0} of a frame of {frame_width:.0}, {frame_height:.0} \
-             drawn at {drawn:?}, over {} line(s)",
-            lines.len()
-        );
         let Some(word) = crate::hover::word_under(&lines, point, frame_width, frame_height, drawn)
         else {
-            tracing::debug!("there is no word under the pointer");
             self.hovered_word(None);
             self.card.hide();
             return;
         };
-        tracing::debug!("the word under the pointer is {:?}", word.text);
         self.hovered_word(Some(word.bounds));
         let text = word.text.trim().to_owned();
         if text.is_empty() {
             self.card.hide();
             return;
         }
+        if self.looked_up.borrow().as_deref() == Some(text.as_str()) {
+            return;
+        }
+        *self.looked_up.borrow_mut() = Some(text.clone());
+        tracing::debug!("the word under the pointer is {text:?}");
         let _ = self.reader.jobs.try_send(Asking::Pointed { text });
     }
 
@@ -1677,13 +1673,9 @@ impl Window {
     fn show_entries(
         &self,
         pointed: bool,
-        range: Option<(usize, usize)>,
         text: &str,
         entries: &[crate::yomitan::Entry],
     ) {
-        if let Some(range) = range {
-            self.select(range);
-        }
         if entries.is_empty() {
             self.set_status(&format!("Nothing is known about {text}."));
             self.card.hide();
