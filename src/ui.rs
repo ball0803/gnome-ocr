@@ -504,6 +504,11 @@ struct Window {
     readings: gtk::CheckButton,
     lookup_button: gtk::Button,
     card: crate::card::Card,
+    /// The keys the app was told about, by its own keyboard.
+    ///
+    /// The pointer does not say which keys are held unless the app has the
+    /// keyboard, so the app listens for the keys itself.
+    keys: Cell<gdk::ModifierType>,
     /// Where the pointer was, in the pixels of the widget it was over.
     pointer: RefCell<Option<(f64, f64)>>,
     /// Whether the pointer was over the text rather than the preview.
@@ -749,6 +754,7 @@ impl Window {
             readings,
             lookup_button: lookup_button.clone(),
             card: crate::card::Card::new(),
+            keys: Cell::new(gdk::ModifierType::empty()),
             pointer: RefCell::new(None),
             over_text: Cell::new(false),
             scan_source: RefCell::new(None),
@@ -920,6 +926,27 @@ impl Window {
             owner.text_pointer_moved(x, y);
         });
         self.text_view.add_controller(motion);
+
+        let keys = gtk::EventControllerKey::new();
+        let owner = Rc::clone(self);
+        keys.connect_key_pressed(move |_controller, key, _code, state| {
+            owner.key_changed(key, state);
+            glib::Propagation::Proceed
+        });
+        let owner = Rc::clone(self);
+        keys.connect_key_released(move |_controller, key, _code, state| {
+            owner.key_changed(key, state);
+        });
+        self.root.add_controller(keys);
+
+        // The keys the app was told about are only true while it has the
+        // keyboard.
+        let owner = Rc::clone(self);
+        self.root.connect_notify_local(Some("is-active"), move |window, _| {
+            if !window.is_active() {
+                owner.keys.set(gdk::ModifierType::empty());
+            }
+        });
 
         if let Some(pointer) = gdk::Display::default()
             .and_then(|display| display.default_seat())
@@ -1407,7 +1434,7 @@ impl Window {
     /// the pointer over the preview does not keep asking the dictionary.
     fn pointer_moved(self: &Rc<Self>, x: f64, y: f64, from_event: gdk::ModifierType) {
         let settings = crate::settings::read(&self.settings);
-        let from_device = Self::keys_held();
+        let from_device = self.keys_held();
         let held = from_event | from_device;
         tracing::debug!(
             "the pointer is at {x:.0}, {y:.0}; the event says {from_event:?}, the device \
@@ -1428,7 +1455,7 @@ impl Window {
     /// The pointer moved over the text.
     fn text_pointer_moved(self: &Rc<Self>, x: f64, y: f64) {
         let settings = crate::settings::read(&self.settings);
-        let held = Self::keys_held();
+        let held = self.keys_held();
         tracing::debug!(
             "the pointer is over the text at {x:.0}, {y:.0}; the keys held are {held:?}; \
              the key wanted is {:?}",
@@ -1443,17 +1470,30 @@ impl Window {
         self.restart_scan(settings.scan_delay);
     }
 
+    /// A key was pressed or released.
+    fn key_changed(&self, key: gdk::Key, state: gdk::ModifierType) {
+        let mut held = state;
+        match key {
+            gdk::Key::Shift_L | gdk::Key::Shift_R => held |= gdk::ModifierType::SHIFT_MASK,
+            gdk::Key::Control_L | gdk::Key::Control_R => held |= gdk::ModifierType::CONTROL_MASK,
+            gdk::Key::Alt_L | gdk::Key::Alt_R => held |= gdk::ModifierType::ALT_MASK,
+            _ => {}
+        }
+        tracing::debug!("a key was pressed or released; the keys held are {held:?}");
+        self.keys.set(held);
+    }
+
     /// The keys that are held down.
     ///
-    /// The state is taken from the pointer's own device and not from the
-    /// event that moved it, because the event does not always say which keys
-    /// were held.
-    fn keys_held() -> gdk::ModifierType {
-        gdk::Display::default()
+    /// The app's own keyboard is asked first, because the pointer does not
+    /// say which keys are held unless the app has the keyboard.
+    fn keys_held(&self) -> gdk::ModifierType {
+        let from_device = gdk::Display::default()
             .and_then(|display| display.default_seat())
             .and_then(|seat| seat.pointer())
             .map(|pointer| pointer.modifier_state())
-            .unwrap_or(gdk::ModifierType::empty())
+            .unwrap_or(gdk::ModifierType::empty());
+        self.keys.get() | from_device
     }
 
     /// The keys have changed, so the word under the pointer is looked up
@@ -1461,7 +1501,7 @@ impl Window {
     /// pointer rests over a word.
     fn keys_changed(self: &Rc<Self>) {
         let settings = crate::settings::read(&self.settings);
-        if Self::keys_held().contains(settings.modifier.mask()) {
+        if self.keys_held().contains(settings.modifier.mask()) {
             tracing::debug!("the keys changed, and the key wanted is held");
             self.restart_scan(settings.scan_delay);
         }
