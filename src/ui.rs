@@ -518,6 +518,9 @@ struct Window {
     /// Whether the word under the pointer has been looked up since it last
     /// moved.
     scanned: Cell<bool>,
+    /// What is under the pointer, so that a pointer which only jitters is
+    /// taken to be still.
+    under: RefCell<Option<String>>,
     settings: settings::Shared,
     copy_button: gtk::Button,
     clear_button: gtk::Button,
@@ -762,6 +765,7 @@ impl Window {
             over_text: Cell::new(false),
             last_moved: Cell::new(0.0),
             scanned: Cell::new(false),
+            under: RefCell::new(None),
             settings: settings.clone(),
             copy_button,
             clear_button,
@@ -1460,9 +1464,8 @@ impl Window {
             return;
         }
         self.over_text.set(false);
-        self.last_moved.set(now_seconds());
-        self.scanned.set(false);
         *self.pointer.borrow_mut() = Some((x, y));
+        self.thing_changed(self.word_under(x, y));
     }
 
     /// The pointer moved over the text.
@@ -1479,9 +1482,12 @@ impl Window {
             return;
         }
         self.over_text.set(true);
-        self.last_moved.set(now_seconds());
-        self.scanned.set(false);
         *self.pointer.borrow_mut() = Some((x, y));
+        let character = self
+            .text_view
+            .iter_at_location(x.round() as i32, y.round() as i32)
+            .map(|iter| iter.offset());
+        self.thing_changed(character.map(|offset| format!("t{offset}")));
     }
 
     /// A key was pressed or released.
@@ -1522,6 +1528,30 @@ impl Window {
         }
     }
 
+    /// Notes that the thing under the pointer is a different one.
+    ///
+    /// The pointer jitters, and a pointer that only jitters is still. What
+    /// matters is not whether the pointer moved, but whether it is over
+    /// something else now.
+    fn thing_changed(&self, thing: Option<String>) {
+        let changed = self.under.borrow().as_deref() != thing.as_deref();
+        *self.under.borrow_mut() = thing;
+        if changed {
+            self.last_moved.set(now_seconds());
+            self.scanned.set(false);
+        }
+    }
+
+    /// The word under the pointer in the preview, if there is one.
+    fn word_under(&self, x: f64, y: f64) -> Option<String> {
+        let (frame_width, frame_height) = self.preview.frame_size.get();
+        let drawn = self.preview.rect.get()?;
+        let lines = self.preview.detections.borrow().clone();
+        let point = crate::hover::Point::new(x, y);
+        let word = crate::hover::word_under(&lines, point, frame_width, frame_height, drawn)?;
+        Some(word.text.clone())
+    }
+
     /// Looks the word up, if the pointer has rested over one long enough.
     ///
     /// The timer runs for as long as the app does, so that there is never a
@@ -1529,16 +1559,20 @@ impl Window {
     /// the app, which is what the earlier one did.
     fn tick(&self) {
         let settings = crate::settings::read(&self.settings);
-        if !self.keys_held().contains(settings.modifier.mask()) {
+        let held = self.keys_held();
+        let wanted = settings.modifier.mask();
+        let delay = f64::from(settings.scan_delay) / 1000.0;
+        let rested = now_seconds() - self.last_moved.get();
+        if !held.contains(wanted) {
             return;
         }
-        let delay = f64::from(settings.scan_delay) / 1000.0;
-        if now_seconds() - self.last_moved.get() < delay {
+        if rested < delay {
             return;
         }
         if self.scanned.replace(true) {
             return;
         }
+        tracing::debug!("the pointer has rested for {rested:.2}s; looking it up");
         self.scan();
     }
 
@@ -1548,24 +1582,26 @@ impl Window {
             return;
         };
         if self.over_text.get() {
-            let Some(iter) = self
-                .text_view
-                .iter_at_location(x.round() as i32, y.round() as i32)
-            else {
-                return;
-            };
-            let offset = iter.offset() as usize;
             let text = self
                 .buffer
                 .text(&self.buffer.start_iter(), &self.buffer.end_iter(), false)
                 .to_string();
+            if text.is_empty() {
+                tracing::debug!("there is no text to look at yet");
+                return;
+            }
+            let Some(iter) = self
+                .text_view
+                .iter_at_location(x.round() as i32, y.round() as i32)
+            else {
+                tracing::debug!("there is no character at {x:.0}, {y:.0} of the text");
+                return;
+            };
+            let offset = iter.offset() as usize;
             tracing::debug!(
                 "looking at character {offset} of {} character(s) of text",
                 text.chars().count()
             );
-            if text.is_empty() {
-                return;
-            }
             let _ = self
                 .reader
                 .jobs
@@ -1575,6 +1611,7 @@ impl Window {
 
         let (frame_width, frame_height) = self.preview.frame_size.get();
         let Some(drawn) = self.preview.rect.get() else {
+            tracing::debug!("there is no picture of the screen to look at yet");
             return;
         };
         let lines = self.preview.detections.borrow().clone();
@@ -1860,8 +1897,15 @@ fn settings_panel(settings: settings::Shared) -> (gtk::Box, gtk::CheckButton) {
     (panel, readings)
 }
 
+/// When the app started.
+fn started() -> std::time::Instant {
+    static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *STARTED.get_or_init(std::time::Instant::now)
+}
+
+/// How long it is since the app started, in seconds.
 fn now_seconds() -> f64 {
-    std::time::Instant::now().elapsed().as_secs_f64()
+    started().elapsed().as_secs_f64()
 }
 
 fn labelled(text: &str, control: &impl IsA<gtk::Widget>, tooltip: &str) -> gtk::Box {
