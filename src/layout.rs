@@ -9,6 +9,24 @@
 //!
 //! Vertical runs, which is how Japanese is often written, are kept apart and
 //! read from the right.
+//!
+//! # How the thresholds are worked out
+//!
+//! Every threshold here is a ratio of something measured from the page, and
+//! never an absolute size, which is the point of the document spectrum: the
+//! tolerances are multipliers of the spacings that the page itself shows.
+//!
+//! - The size of the ordinary text comes from the height that most of the
+//!   lines share.
+//! - Where one block ends and the next begins comes from the gaps between
+//!   the lines, split into a lower and an upper group by Otsu's method, the
+//!   same thresholding an image histogram uses.
+//! - The measure of the text, which says how wide a line of running text
+//!   reaches, is the width of the widest line on the page.
+//!
+//! The only number that is not a ratio is how many entries make a list,
+//! which is a definition rather than a tolerance: the list detection work
+//! says a list is three or more records.
 
 /// A rectangle in the pixels of the frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -81,38 +99,99 @@ pub struct Line {
 }
 
 
-/// The longest text an item of a list may have. The entries of a menu are
-/// short; a paragraph of running text is not.
-const MAX_ITEM_CHARS: usize = 24;
+/// The measure of the text: the width of the widest line on the page.
+///
+/// A line of running text reaches the measure, because it is wrapped to it.
+/// An entry of a list does not, so it is short compared with the measure.
+fn text_measure(lines: &[&Line]) -> f64 {
+    lines
+        .iter()
+        .map(|line| line.bounds.width)
+        .fold(0.0, f64::max)
+}
 
-/// How far the left edges of the items of a list may differ, as a fraction
-/// of the height of the text. The entries of a menu line up, and an entry
-/// that is indented belongs to a different level.
-const ITEM_ALIGNMENT: f64 = 0.6;
-
-/// How much the gaps between the items of a list may differ, as a fraction
-/// of the height of the text.
-const ITEM_GAP: f64 = 0.8;
+/// How far the left edges of two lines may differ and still count as the
+/// same alignment, as a fraction of the height of the text.
+///
+/// The text is the unit: a shift of half a line or less still reads as the
+/// same alignment, while a deeper indent is a different level.
+const ITEM_ALIGNMENT: f64 = 0.5;
 
 /// How many items a run needs before it counts as a list.
 const MIN_LIST_ITEMS: usize = 3;
 
-/// Finds the runs of lines that are a list: short entries that line up and
-/// are spaced evenly.
+
+/// Splits the values into a lower and an upper group, the way Otsu's method
+/// splits an image histogram: the threshold that makes the two groups as
+/// different from each other as possible.
 ///
-/// This is the rule the layout analysis literature uses. The entries of a
-/// menu are short, share a left edge, and are separated by even gaps, and
-/// the gap that sets a list apart from what is around it is larger. An
-/// entry that is indented further along is at a different level, so it
-/// starts a list of its own.
+/// This is how the gap between two lines is decided to be a boundary or not,
+/// without a threshold chosen by hand.
+fn otsu_threshold(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    let lowest = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let highest = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = highest - lowest;
+    if span <= f64::EPSILON {
+        return None;
+    }
+
+    const BINS: usize = 64;
+    let mut histogram = [0usize; BINS];
+    for value in values {
+        let bin = (((value - lowest) / span) * (BINS - 1) as f64).round() as usize;
+        histogram[bin] += 1;
+    }
+
+    let total = values.len();
+    let mut total_sum = 0.0;
+    for (bin, count) in histogram.iter().enumerate() {
+        total_sum += *count as f64 * (bin as f64 + 0.5);
+    }
+
+    let mut best_variance = 0.0f64;
+    let mut best_bin = 0usize;
+    let mut lower_sum = 0.0;
+    let mut lower_count = 0usize;
+    for (bin, count) in histogram.iter().enumerate() {
+        lower_count += count;
+        if lower_count == 0 {
+            continue;
+        }
+        let upper_count = total - lower_count;
+        if upper_count == 0 {
+            break;
+        }
+        lower_sum += *count as f64 * (bin as f64 + 0.5);
+        let lower_mean = lower_sum / lower_count as f64;
+        let upper_mean = (total_sum - lower_sum) / upper_count as f64;
+        let variance = lower_count as f64 * upper_count as f64 * (lower_mean - upper_mean).powi(2);
+        if variance > best_variance {
+            best_variance = variance;
+            best_bin = bin;
+        }
+    }
+
+    Some(lowest + (best_bin as f64 + 0.5) * span / (BINS - 1) as f64)
+}
+
+/// Finds the runs of blocks that are a list.
 ///
-/// The lines are first put into bands by their left edge. The entries of a
-/// menu sit at the same height as the entries of the column beside them, so
-/// looking at the page as it comes would never find two of them together.
-fn detect_lists(lines: &[&Line], median_height: f64) -> Vec<Vec<usize>> {
+/// The entries of a menu are separate blocks that share a left edge and sit
+/// an even distance apart, and the distance that sets a list apart from the
+/// rest of the page is larger. Which distance is larger is worked out from
+/// the gaps themselves, by splitting them into a lower and an upper group
+/// with Otsu's method, so no threshold is chosen by hand.
+fn detect_lists(
+    lines: &[&Line],
+    median_height: f64,
+    threshold: Option<f64>,
+) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for band in align_bands(lines, median_height) {
-        detect_runs(&band, lines, median_height, &mut groups);
+        detect_runs(&band, lines, threshold, median_height, &mut groups);
     }
     groups
 }
@@ -161,6 +240,7 @@ fn align_bands(lines: &[&Line], median_height: f64) -> Vec<Vec<usize>> {
 fn detect_runs(
     band: &[usize],
     lines: &[&Line],
+    threshold: Option<f64>,
     median_height: f64,
     groups: &mut Vec<Vec<usize>>,
 ) {
@@ -173,25 +253,57 @@ fn detect_runs(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    let gaps = gaps_between(&ordered, lines);
+    let threshold = threshold.unwrap_or(median_height);
+
+    // Whether a line is an entry of its own. The engine's layout model knows
+    // which lines are separate items and which are the wrapped lines of one
+    // paragraph, so it is asked first. Without it, a line that is short
+    // compared with the measure of the text is taken to be an entry.
+    let engine_grouped = lines.iter().any(|line| line.block_id != 0);
+    let measure = text_measure(lines);
+
     let mut run: Vec<usize> = Vec::new();
-    for index in ordered {
-        let line = lines[index];
-        if line.text.chars().count() > MAX_ITEM_CHARS {
+    for (position, index) in ordered.iter().enumerate() {
+        let line = lines[*index];
+        let is_entry = if engine_grouped {
+            match position.checked_sub(1).map(|previous| ordered[previous]) {
+                Some(previous) => line.block_id != lines[previous].block_id,
+                None => true,
+            }
+        } else {
+            line.bounds.width * 2.0 <= measure
+        };
+        if !is_entry {
             push_group(&mut run, groups);
             continue;
         }
-        if run.len() >= 2 {
-            let previous = lines[run[run.len() - 1]];
-            let before = lines[run[run.len() - 2]];
-            let now = line.bounds.y - previous.bounds.bottom();
-            let was = previous.bounds.y - before.bounds.bottom();
-            if (now - was).abs() > ITEM_GAP * median_height {
-                push_group(&mut run, groups);
-            }
+        if position > 0 && gaps[position - 1] > threshold {
+            push_group(&mut run, groups);
         }
-        run.push(index);
+        run.push(*index);
     }
     push_group(&mut run, groups);
+}
+
+/// The vertical gaps between the lines of a run, from the top down.
+fn gaps_between(run: &[usize], lines: &[&Line]) -> Vec<f64> {
+    let mut ordered: Vec<usize> = run.to_vec();
+    ordered.sort_by(|a, b| {
+        lines[*a]
+            .bounds
+            .y
+            .partial_cmp(&lines[*b].bounds.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ordered
+        .windows(2)
+        .map(|pair| {
+            let upper = lines[pair[0]].bounds.bottom();
+            let lower = lines[pair[1]].bounds.y;
+            (lower - upper).max(0.0)
+        })
+        .collect()
 }
 
 /// Keeps a run of lines if it is long enough to be a list.
@@ -310,14 +422,6 @@ pub struct Heading {
     /// 1 is the largest.
     pub level: u8,
 }
-
-/// How far the left edge of a line may drift and still be the same
-/// paragraph, as a fraction of the height of the text.
-const EDGE_TOLERANCE: f64 = 0.6;
-
-/// How far apart two lines may be and still be the same paragraph, as a
-/// fraction of the height of the text.
-const PARAGRAPH_GAP: f64 = 0.75;
 
 /// How wide a gap has to be before it separates two columns, as a fraction
 /// of the height of the text.
@@ -454,10 +558,21 @@ fn order_horizontal(
             )
     });
 
+    // Where one block ends and the next begins is a property of the page, so
+    // the gaps of every band are looked at together and split into a lower
+    // and an upper group. Where one block ends and the next begins is what
+    // the gaps are compared against.
+    let bands = align_bands(&sorted, median_height);
+    let page_gaps: Vec<f64> = bands
+        .iter()
+        .flat_map(|band| gaps_between(band, &sorted))
+        .collect();
+    let threshold = otsu_threshold(&page_gaps);
+
     // The runs of short, aligned lines are a list, such as the entries of a
     // menu, and are kept together as one block.
     let groups = if lists {
-        detect_lists(&sorted, median_height)
+        detect_lists(&sorted, median_height, threshold)
     } else {
         Vec::new()
     };
@@ -500,7 +615,7 @@ fn order_horizontal(
         let mut paragraphs = Vec::new();
         for band in align_bands(&body, median_height) {
             let lines: Vec<&Line> = band.iter().map(|index| body[*index]).collect();
-            paragraphs.extend(group_by_geometry(&lines, median_height, clump));
+            paragraphs.extend(group_by_geometry(&lines, median_height, threshold, clump));
         }
         paragraphs
     };
@@ -665,18 +780,43 @@ fn group_by_block(lines: &[&Line], clump: bool) -> Vec<Paragraph> {
 }
 
 /// Groups the lines by their left edge and the gap between them.
-fn group_by_geometry(lines: &[&Line], median_height: f64, clump: bool) -> Vec<Paragraph> {
+fn group_by_geometry(
+    lines: &[&Line],
+    median_height: f64,
+    threshold: Option<f64>,
+    clump: bool,
+) -> Vec<Paragraph> {
+    let mut sorted: Vec<&Line> = lines.to_vec();
+    sorted.sort_by(|a, b| {
+        a.bounds
+            .y
+            .partial_cmp(&b.bounds.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Where one block ends and the next begins is worked out from the gaps
+    // themselves, by splitting them into a lower and an upper group with
+    // Otsu's method. The lines that are close together are one block, and
+    // the ones that are further apart are not.
+    let gaps: Vec<f64> = sorted
+        .windows(2)
+        .map(|pair| {
+            let upper = pair[0].bounds.bottom();
+            let lower = pair[1].bounds.y;
+            (lower - upper).max(0.0)
+        })
+        .collect();
+    let threshold = threshold.unwrap_or(median_height);
+
     let mut paragraphs: Vec<Paragraph> = Vec::new();
     let mut current: Vec<&Line> = Vec::new();
     let mut current_left: Option<f64> = None;
-    let mut previous_bottom: Option<f64> = None;
 
-    for line in lines {
-        let continues = match (current_left, previous_bottom) {
-            (Some(left), Some(bottom)) => {
-                let same_edge = (line.bounds.x - left).abs() <= EDGE_TOLERANCE * median_height;
-                let gap = line.bounds.y - bottom;
-                same_edge && gap <= PARAGRAPH_GAP * median_height && gap > -median_height
+    for (position, line) in sorted.iter().enumerate() {
+        let continues = match (current_left, position) {
+            (Some(left), position) if position > 0 => {
+                let same_edge = (line.bounds.x - left).abs() <= ITEM_ALIGNMENT * median_height;
+                same_edge && gaps[position - 1] <= threshold
             }
             _ => false,
         };
@@ -690,7 +830,6 @@ fn group_by_geometry(lines: &[&Line], median_height: f64, clump: bool) -> Vec<Pa
             current = vec![line];
             current_left = Some(line.bounds.x);
         }
-        previous_bottom = Some(line.bounds.bottom());
     }
 
     if !current.is_empty() {

@@ -128,6 +128,13 @@ document analysis literature does it:
   together. An entry that is indented further along is at a different level
   and starts a list of its own
 
+Every threshold used for this is a ratio of something measured from the page
+itself, never an absolute size: the size of the ordinary text comes from the
+height most of the lines share, the gap that sets one block apart from the
+next comes from splitting the gaps between the lines into a lower and an
+upper group, and the measure of the text, which says how wide a line of
+running text reaches, is the width of the widest line on the page.
+
 The thresholds are all relative to the size of the ordinary text, so they
 hold at any resolution.
 
