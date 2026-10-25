@@ -364,7 +364,10 @@ struct Item {
 ///
 /// When `clump` is set, the lines of a paragraph are joined into one line.
 /// Otherwise each keeps its own line.
-pub fn analyse(lines: &[Line], clump: bool) -> Layout {
+///
+/// When `lists` is set, the runs of short, aligned entries are gathered into
+/// one list. Otherwise each entry is kept on its own.
+pub fn analyse(lines: &[Line], clump: bool, lists: bool) -> Layout {
     let text_lines: Vec<&Line> = lines.iter().filter(|line| line.is_text).collect();
     if text_lines.is_empty() {
         return Layout::default();
@@ -380,7 +383,7 @@ pub fn analyse(lines: &[Line], clump: bool) -> Layout {
     let (vertical, horizontal): (Vec<&Line>, Vec<&Line>) =
         text_lines.iter().partition(|line| line.is_vertical);
 
-    let mut blocks = order_horizontal(&horizontal, median_height, clump);
+    let mut blocks = order_horizontal(&horizontal, median_height, clump, lists);
 
     // Vertical runs are read from the right, and come after the horizontal
     // ones.
@@ -423,7 +426,12 @@ fn body_height(heights: &[f64]) -> f64 {
 }
 
 /// Orders the lines that run across, and works out the headings.
-fn order_horizontal(lines: &[&Line], median_height: f64, clump: bool) -> Vec<Block> {
+fn order_horizontal(
+    lines: &[&Line],
+    median_height: f64,
+    clump: bool,
+    lists: bool,
+) -> Vec<Block> {
     if lines.is_empty() {
         return Vec::new();
     }
@@ -448,7 +456,11 @@ fn order_horizontal(lines: &[&Line], median_height: f64, clump: bool) -> Vec<Blo
 
     // The runs of short, aligned lines are a list, such as the entries of a
     // menu, and are kept together as one block.
-    let groups = detect_lists(&sorted, median_height);
+    let groups = if lists {
+        detect_lists(&sorted, median_height)
+    } else {
+        Vec::new()
+    };
     let mut listed = vec![false; sorted.len()];
     for group in &groups {
         for index in group {
@@ -906,7 +918,7 @@ mod tests {
             line("second", 100.0, 130.0, 200.0, 20.0),
             line("third", 100.0, 160.0, 200.0, 20.0),
         ];
-        let layout = analyse(&lines, true);
+        let layout = analyse(&lines, true, true);
         assert_eq!(texts(&layout.blocks), vec!["first second third"]);
     }
 
@@ -922,7 +934,7 @@ mod tests {
         let mut third = line("and a third line", 60.0, 160.0, 300.0, 20.0);
         third.block_id = 1;
 
-        let layout = analyse(&[first, second, third], true);
+        let layout = analyse(&[first, second, third], true, true);
         assert_eq!(texts(&layout.blocks), vec!["A paragraph that starts with an indented first line and a third line"]);
     }
 
@@ -934,7 +946,7 @@ mod tests {
         let mut second = line("two", 60.0, 300.0, 200.0, 20.0);
         second.block_id = 2;
 
-        let layout = analyse(&[first, second], true);
+        let layout = analyse(&[first, second], true, true);
         assert_eq!(texts(&layout.blocks), vec!["one", "two"]);
     }
 
@@ -951,7 +963,7 @@ mod tests {
         let mut other = line("A separate label", 60.0, 200.0, 200.0, 20.0);
         other.block_id = 2;
 
-        let layout = analyse(&[heading, first, second, other], true);
+        let layout = analyse(&[heading, first, second, other], true, true);
         assert_eq!(
             texts(&layout.blocks),
             vec![
@@ -1019,7 +1031,7 @@ mod tests {
             line("プレミアムサービスをはじめる", 1142.0, 967.0, 214.0, 16.0),
         ];
 
-        let layout = analyse(&lines, true);
+        let layout = analyse(&lines, true, true);
 
         // The entries of the menu come out as one list.
         let lists: Vec<&Vec<String>> = layout
@@ -1039,6 +1051,34 @@ mod tests {
         );
     }
 
+    /// With the gathering turned off, the entries of the menu are kept on
+    /// their own.
+    #[test]
+    fn the_entries_of_a_menu_can_be_kept_apart() {
+        let mut first = line("Q", 24.0, 75.0, 20.0, 16.0);
+        first.block_id = 1;
+        let mut second = line("A section", 27.0, 127.0, 188.0, 20.0);
+        second.block_id = 2;
+        let mut third = line("Another section", 24.0, 179.0, 208.0, 19.0);
+        third.block_id = 3;
+        let mut fourth = line("And another", 26.0, 229.0, 171.0, 24.0);
+        fourth.block_id = 4;
+
+        let lines = vec![first, second, third, fourth];
+        let gathered = analyse(&lines, true, true);
+        let apart = analyse(&lines, true, false);
+
+        let lists = |layout: &crate::layout::Layout| {
+            layout
+                .blocks
+                .iter()
+                .filter(|block| matches!(block, crate::layout::Block::List { .. }))
+                .count()
+        };
+        assert_eq!(lists(&gathered), 1, "the menu should be gathered");
+        assert_eq!(lists(&apart), 0, "the menu should not be gathered");
+    }
+
     /// With the joining turned off, each line keeps its own line.
     #[test]
     fn the_lines_of_a_paragraph_can_be_kept_apart() {
@@ -1046,7 +1086,7 @@ mod tests {
             line("first", 100.0, 100.0, 200.0, 20.0),
             line("second", 100.0, 130.0, 200.0, 20.0),
         ];
-        let layout = analyse(&lines, false);
+        let layout = analyse(&lines, false, true);
         assert_eq!(texts(&layout.blocks), vec!["first\nsecond"]);
     }
 
@@ -1056,7 +1096,7 @@ mod tests {
             line("first", 100.0, 100.0, 200.0, 20.0),
             line("second", 100.0, 400.0, 200.0, 20.0),
         ];
-        let layout = analyse(&lines, true);
+        let layout = analyse(&lines, true, true);
         assert_eq!(texts(&layout.blocks), vec!["first", "second"]);
     }
 
@@ -1068,7 +1108,7 @@ mod tests {
             line("right one", 700.0, 100.0, 150.0, 20.0),
             line("right two", 700.0, 130.0, 150.0, 20.0),
         ];
-        let layout = analyse(&lines, true);
+        let layout = analyse(&lines, true, true);
         assert_eq!(
             texts(&layout.blocks),
             vec!["left one left two", "right one right two"]
@@ -1082,7 +1122,7 @@ mod tests {
             line("two", 100.0, 128.0, 200.0, 20.0),
             line("three", 100.0, 300.0, 200.0, 20.0),
         ];
-        let layout = analyse(&lines, true);
+        let layout = analyse(&lines, true, true);
         assert_eq!(texts(&layout.blocks).len(), 2);
         assert!(layout.blocks[0].text().contains("one"));
         assert!(layout.blocks[1].text().contains("three"));
@@ -1094,7 +1134,7 @@ mod tests {
             line("A Heading", 100.0, 100.0, 400.0, 50.0),
             line("body text", 100.0, 170.0, 200.0, 20.0),
         ];
-        let layout = analyse(&lines, true);
+        let layout = analyse(&lines, true, true);
         assert!(matches!(layout.blocks[0], Block::Heading { level: 1, .. }));
         let sections = layout.sections();
         assert_eq!(sections.len(), 1);
@@ -1109,7 +1149,7 @@ mod tests {
         let mut right = line("right column", 500.0, 100.0, 30.0, 200.0);
         right.is_vertical = true;
 
-        let layout = analyse(&[left, right], true);
+        let layout = analyse(&[left, right], true, true);
         assert_eq!(texts(&layout.blocks), vec!["right column", "left column"]);
     }
 
@@ -1123,7 +1163,7 @@ mod tests {
         let mut text_line = line("", 10.0, 10.0, 110.0, 20.0);
         text_line.words = vec![first, second];
 
-        let layout = analyse(&[text_line], true);
+        let layout = analyse(&[text_line], true, true);
         assert_eq!(layout.blocks[0].text(), "Hello World");
     }
 
@@ -1133,13 +1173,13 @@ mod tests {
         rule.is_text = false;
         let lines = vec![rule, line("real text", 10.0, 40.0, 200.0, 20.0)];
 
-        let layout = analyse(&lines, true);
+        let layout = analyse(&lines, true, true);
         assert_eq!(texts(&layout.blocks), vec!["real text"]);
     }
 
     #[test]
     fn nothing_gives_an_empty_layout() {
-        let layout = analyse(&[], true);
+        let layout = analyse(&[], true, true);
         assert!(layout.blocks.is_empty());
         assert!(layout.blocks.is_empty());
     }

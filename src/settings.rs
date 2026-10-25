@@ -21,6 +21,9 @@ pub struct Settings {
     /// Whether lines that belong to the same paragraph are joined into one
     /// line, rather than each keeping its own line.
     pub clump: bool,
+    /// Whether the runs of short, aligned entries are gathered into one list,
+    /// rather than each entry being kept on its own.
+    pub lists: bool,
 }
 
 impl Default for Settings {
@@ -29,6 +32,7 @@ impl Default for Settings {
             overlap: 0.5,
             dimension: 0.9,
             clump: true,
+            lists: true,
         }
     }
 }

@@ -98,9 +98,10 @@ memory only, so nothing is left behind on disk. They are shown at the size
 they were made, rather than being scaled to fit.
 
 **Settings** opens a panel with the two thresholds that decide whether two
-detections are in the same place, and a choice of whether the lines that
-belong to the same paragraph are joined into one line or each keeps its own.
-They can all be tuned while the app runs.
+detections are in the same place, and two choices of how the text is grouped:
+whether the lines that belong to the same paragraph are joined into one line,
+and whether the short entries that line up, such as the entries of a menu, are
+gathered into one list. They can all be tuned while the app runs.
 
 ## The order of the text
 

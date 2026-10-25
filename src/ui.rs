@@ -1152,6 +1152,15 @@ fn settings_panel(settings: settings::Shared) -> gtk::Box {
     ));
     panel.append(&clump);
 
+    let lists = gtk::CheckButton::with_label("Gather list entries");
+    lists.set_active(current.lists);
+    lists.set_tooltip_text(Some(
+        "When on, the short entries that line up, such as the entries of a \
+         menu, are gathered into one list. When off, each entry is kept on \
+         its own.",
+    ));
+    panel.append(&lists);
+
     let for_overlap = settings.clone();
     overlap.connect_value_changed(move |spin| {
         if let Ok(mut settings) = for_overlap.lock() {
@@ -1170,6 +1179,13 @@ fn settings_panel(settings: settings::Shared) -> gtk::Box {
     clump.connect_toggled(move |button| {
         if let Ok(mut settings) = for_clump.lock() {
             settings.clump = button.is_active();
+        }
+    });
+
+    let for_lists = settings.clone();
+    lists.connect_toggled(move |button| {
+        if let Ok(mut settings) = for_lists.lock() {
+            settings.lists = button.is_active();
         }
     });
 
