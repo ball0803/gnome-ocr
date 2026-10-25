@@ -132,8 +132,9 @@ document analysis literature does it:
   together. An entry that is indented further along is at a different level
   and starts a list of its own
 
-Where the page has a large gap between two pieces of text, a blank line is
-left between them in the output, so that the break is kept.
+Where the page has a large gap between two pieces of text, the break is kept
+and the next piece is set out with an ideographic space, which is how a
+paragraph is marked in Japanese.
 
 Every threshold used for this is a ratio of something measured from the page
 itself, never an absolute size: the size of the ordinary text comes from the

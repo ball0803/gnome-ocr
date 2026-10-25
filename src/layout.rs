@@ -654,8 +654,14 @@ fn order_horizontal(
     (placed, threshold.unwrap_or(median_height))
 }
 
-/// Joins the blocks into text, leaving a blank line where the page has a
-/// large gap between two of them.
+/// The ideographic space, which is how a paragraph is marked in Japanese.
+const IDEOGRAPHIC_SPACE: char = '\u{3000}';
+
+/// Joins the blocks into text.
+///
+/// Where the page has a large gap between two blocks, the break is kept and
+/// the next block is set out with an ideographic space, which is how a
+/// paragraph is marked in Japanese.
 pub fn join_blocks(blocks: &[Block], block_gap: f64) -> String {
     let mut text = String::new();
     let mut previous: Option<Rect> = None;
@@ -664,7 +670,7 @@ pub fn join_blocks(blocks: &[Block], block_gap: f64) -> String {
         if let Some(previous) = previous {
             text.push('\n');
             if bounds.y - previous.bottom() > block_gap {
-                text.push('\n');
+                text.push(IDEOGRAPHIC_SPACE);
             }
         }
         text.push_str(&block.text());
@@ -1253,8 +1259,12 @@ mod tests {
         let layout = analyse(&[first, second], true, true);
         let text = crate::layout::join_blocks(&layout.blocks, layout.block_gap);
         assert!(
-            text.contains("\n\n"),
-            "a large gap should leave a blank line, got {text:?}"
+            text.contains("\n\u{3000}"),
+            "a large gap should leave an ideographic space, got {text:?}"
+        );
+        assert!(
+            text.as_bytes().contains(&0xE3u8),
+            "the space must be the ideographic one, not a plain one: {text:?}"
         );
     }
 
