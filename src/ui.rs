@@ -501,6 +501,9 @@ struct Window {
     /// Whether the word under the pointer has been looked up since it last
     /// moved.
     scanned: Cell<bool>,
+    /// The word that is selected, so that it is still selected when the text
+    /// is shown again.
+    selected: RefCell<Option<(usize, usize)>>,
     /// The word that was selected last, so that the window does not keep
     /// saying it.
     looked_up: RefCell<Option<String>>,
@@ -751,6 +754,7 @@ impl Window {
             over_text: Cell::new(false),
             last_moved: Cell::new(0.0),
             scanned: Cell::new(false),
+            selected: RefCell::new(None),
             looked_up: RefCell::new(None),
             under: RefCell::new(None),
             settings: settings.clone(),
@@ -1451,6 +1455,11 @@ impl Window {
             .collect::<Vec<_>>()
             .concat();
         self.buffer.set_text(&all);
+        // Setting the text takes the selection away, so it is put back.
+        let selected = *self.selected.borrow();
+        if let Some(range) = selected {
+            self.select_now(range);
+        }
         self.scroll_to_end();
     }
 
@@ -1633,6 +1642,12 @@ impl Window {
     /// Selects a word in the text, so that it is clear which word is being
     /// looked up.
     fn select(&self, range: (usize, usize)) {
+        *self.selected.borrow_mut() = Some(range);
+        self.select_now(range);
+    }
+
+    /// Selects a word in the text.
+    fn select_now(&self, range: (usize, usize)) {
         let mut start = self.buffer.start_iter();
         let mut end = self.buffer.start_iter();
         start.set_offset(range.0 as i32);
